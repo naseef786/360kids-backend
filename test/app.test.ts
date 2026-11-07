@@ -1,0 +1,23 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import type { AddressInfo } from "node:net";
+import { once } from "node:events";
+import { createApp } from "../src/app.js";
+test("API starter reports its limits and handles invalid requests", async () => {
+  const server = createApp("http://localhost:3000").listen(0, "127.0.0.1");
+  await once(server, "listening");
+  const origin = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    const health = await fetch(`${origin}/health/live`);
+    assert.equal(health.status, 200);
+    assert.equal(health.headers.get("x-powered-by"), null);
+    assert.equal((await health.json()).status, "ok");
+    const status = await fetch(`${origin}/v1/status`);
+    assert.deepEqual(await status.json(), { version: "0.1.0", stage: "scaffold", bookingsAvailable: false, whatsappSendingAvailable: false });
+    const missing = await fetch(`${origin}/v1/bookings`);
+    assert.equal(missing.status, 404);
+    const bad = await fetch(`${origin}/v1/status`, { method: "POST", headers: { "Content-Type": "application/json" }, body: "{" });
+    assert.equal(bad.status, 400);
+    assert.deepEqual(await bad.json(), { code: "INVALID_REQUEST", message: "Invalid request body." });
+  } finally { server.closeAllConnections(); await new Promise<void>(resolve => server.close(() => resolve())); }
+});
