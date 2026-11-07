@@ -11,13 +11,17 @@
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/app.test.ts test/whatsapp-policy.test.ts"
+    "test": "node --import tsx --test test/app.test.ts test/whatsapp-policy.test.ts test/platform.test.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "worker": "tsx src/worker.ts"
   },
   "dependencies": {
     "cors": "2.8.6",
     "dotenv": "18.0.9",
     "express": "5.3.0",
+    "express-rate-limit": "8.7.3",
     "helmet": "8.3.0",
+    "pg": "8.23.1",
     "zod": "4.6.7"
   },
   "license": "UNLICENSED",
@@ -26,9 +30,11 @@
     "url": "https://github.com/naseef786/360kids-backend.git"
   },
   "devDependencies": {
+    "@electric-sql/pglite": "0.5.15",
     "@types/cors": "2.8.19",
     "@types/express": "5.0.6",
     "@types/node": "24.19.2",
+    "@types/pg": "8.23.1",
     "tsx": "4.23.15",
     "typescript": "7.0.2"
   }

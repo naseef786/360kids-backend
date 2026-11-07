@@ -11,7 +11,10 @@ server.on("error", (error: NodeJS.ErrnoException) => {
 function shutdown() {
   const timer = setTimeout(() => process.exit(1), 10000);
   timer.unref();
-  server.close(() => { clearTimeout(timer); process.exit(0); });
+  server.close(() => {
+    clearTimeout(timer);
+    process.exit(0);
+  });
 }
 process.once("SIGINT", shutdown);
 process.once("SIGTERM", shutdown);

@@ -6,11 +6,18 @@ export interface ContactPermission {
   bookingUpdates: ConsentState;
   marketing: ConsentState;
 }
-export type Eligibility = { eligible: true } | { eligible: false; reason: "suppressed" | "permission_not_verified" };
-export function checkMessageEligibility(contact: ContactPermission, purpose: MessagePurpose): Eligibility {
+export type Eligibility =
+  | { eligible: true }
+  | { eligible: false; reason: "suppressed" | "permission_not_verified" };
+export function checkMessageEligibility(
+  contact: ContactPermission,
+  purpose: MessagePurpose,
+): Eligibility {
   if (contact.suppressed) return { eligible: false, reason: "suppressed" };
-  const state = purpose === "booking_update" ? contact.bookingUpdates : contact.marketing;
-  if (state !== "verified") return { eligible: false, reason: "permission_not_verified" };
+  const state =
+    purpose === "booking_update" ? contact.bookingUpdates : contact.marketing;
+  if (state !== "verified")
+    return { eligible: false, reason: "permission_not_verified" };
   return { eligible: true };
 }
 // No send API exists. Dispatch must additionally enforce sender ownership, approved
