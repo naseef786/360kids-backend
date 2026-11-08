@@ -1,3 +1,4 @@
+import { NotificationService } from "./notifications.js";
 import { Router, type RequestHandler } from "express";
 import { z } from "zod";
 import { Platform, fail, type Actor } from "./platform.js";
@@ -31,6 +32,7 @@ export const authenticate: Authenticator = async (token) => {
 };
 export function routes(p: Platform, auth: Authenticator = authenticate) {
   const r = Router();
+  const notifications = new NotificationService(p.db);
   r.get("/activities", async (_q, s) => {
     s.json(await p.catalog());
   });
@@ -303,5 +305,23 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
   r.get("/bookings/:id/history", async (q, s) =>
     s.json(await p.history(actor(s), uuid.parse(q.params.id))),
   );
+
+  r.get("/notifications", async (q, s) => {
+    const before = z
+      .string()
+      .regex(/^[1-9][0-9]{0,17}$/)
+      .optional()
+      .parse(q.query.before);
+    s.json(await notifications.list(actor(s), before));
+  });
+  r.post("/notifications/read", async (q, s) => {
+    const b = z
+      .union([
+        z.object({ all: z.literal(true) }),
+        z.object({ ids: z.array(uuid).min(1).max(100) }),
+      ])
+      .parse(q.body);
+    s.json(await notifications.markRead(actor(s), "all" in b ? null : b.ids));
+  });
   return r;
 }

@@ -1,3 +1,4 @@
+import { recordNotifications } from "./notifications.js";
 import { ageAtSession } from "./age.js";
 import { randomUUID, createHash } from "node:crypto";
 import { transaction, type Database, type Connection } from "./database.js";
@@ -24,15 +25,17 @@ export class Platform {
   }
   async audit(
     c: Connection,
-    a: Actor,
+    a: Actor | null,
     subject: string,
     action: string,
     details: unknown = {},
   ) {
+    const auditId = uid();
     await c.query(
       "INSERT INTO app.audit(id,actor_id,subject_id,action,details) VALUES($1,$2,$3,$4,$5)",
-      [uid(), a.id, subject, action, JSON.stringify(details)],
+      [auditId, a?.id ?? null, subject, action, JSON.stringify(details)],
     );
+    await recordNotifications(c, auditId, subject, action);
   }
   admin(a: Actor) {
     if (a.role !== "admin") fail(403, "Admin access required.");
@@ -821,6 +824,7 @@ export class Platform {
           "INSERT INTO app.outbox(id,booking_id,event) VALUES($1,$2,$3)",
           [uid(), b.id, "EXPIRED"],
         );
+        await this.audit(c, null, b.id, "booking.expired");
       }
       return rows.length;
     });

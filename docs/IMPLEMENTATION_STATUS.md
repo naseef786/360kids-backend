@@ -14,6 +14,7 @@
 - Booking idempotency, stale-version checks, transactional allocation, provider acceptance/decline and revised total requiring parent approval.
 - Payment hold windows, finance-gated reference submission/admin verification, cancellation/full-refund obligation and evidence-reference completion.
 - Payment-due expiry worker, audit records and notification outbox events.
+- Authenticated Socket.IO dashboard signals, transactional saved notifications, scoped feed/read APIs, unread counts, reconnect refresh and cross-tab read updates.
 - Provider application/review; admin activity/session publishing; provider correction submission.
 - Bounded contact import validation/commit, E.164 validation, unknown permission by default, opt-out preservation, draft campaigns and restricted admin access.
 
@@ -43,3 +44,7 @@ No claim of complete production delivery is made while the above work remains op
 ## Base-platform update — 8 November 2026
 
 This increment excludes payment and WhatsApp integration work. Public text and policy pages use admin-published content; no legal content is invented. Existing child/account and single-provider-owner assumptions remain. Client Supabase configuration is still required for connected staging use. Browser visual/device checks and hosted PostgreSQL concurrency tests remain outstanding. Memberships, reviews, discounts and other unapproved extras remain outside the agreed baseline.
+
+## Realtime update — 8 November 2026
+
+Partners now have saved dashboard notifications for owned requests and workspace updates, with automatic booking/workspace refresh through Socket.IO. Family and admin notifications are scoped separately. Local verification includes eight passing backend tests (with real Socket.IO connections and tenant-isolation/reconnect checks), backend TypeScript/build, and web lint/TypeScript/build. The normal browser polling/upgrade transport and WebSocket-only clients are tested. Apply migration 003 and configure the matching persistent backend before using this in staging. Hosted service, proxy, load, browser and device verification remain outstanding; source implementation does not mean the client environment is deployed.

@@ -57,6 +57,10 @@ WhatsApp contact import currently accepts bounded JSON batches (32 KB request li
 
 See `docs/IMPLEMENTATION_STATUS.md` for remaining work. Never commit contacts, child details, credentials, receipts or client documents. Environment templates contain placeholders only.
 
+## Dashboard notifications
+
+Socket.IO now serves authenticated live updates on the API port. Partners receive saved notifications for their booking requests and workspace changes, with unread counts, mark-read controls and reconnect refresh in the web app. Families and admins receive their scoped updates too. Run migration 003 before deployment. See `docs/REALTIME.md` for authorization, delivery behavior and persistent-service/reverse-proxy requirements. This does not enable WhatsApp or external push delivery.
+
 ## Base platform modules
 
 Migration 002 adds profile names, archived child profiles, listing versions, managed page content, support tickets and deletion-review requests. `npm run db:migrate` now runs ordered SQL files once, records checksums and rejects changes to applied migrations. Test the migration path on staging before deployment.

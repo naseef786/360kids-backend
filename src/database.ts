@@ -8,6 +8,7 @@ export interface Connection {
 }
 export interface Database {
   connect(): Promise<Connection>;
+  end?(): Promise<void>;
 }
 export function database(): Database {
   if (!process.env.DATABASE_URL)

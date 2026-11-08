@@ -19,6 +19,12 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
       "utf8",
     ),
   );
+  await pg.exec(
+    await readFile(
+      new URL("../database/migrations/003_notifications.sql", import.meta.url),
+      "utf8",
+    ),
+  );
   const db: Database = {
     connect: async () => ({
       query: async (sql, params = []) => {
