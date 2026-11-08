@@ -60,12 +60,10 @@ export function createApp(
     _next,
   ) => {
     if (error instanceof ZodError) {
-      res
-        .status(422)
-        .json({
-          code: "VALIDATION_ERROR",
-          message: error.issues.map((x) => x.message).join(" "),
-        });
+      res.status(422).json({
+        code: "VALIDATION_ERROR",
+        message: error.issues.map((x) => x.message).join(" "),
+      });
       return;
     }
     if (
@@ -74,12 +72,10 @@ export function createApp(
       "code" in error &&
       error.code === "23505"
     ) {
-      res
-        .status(409)
-        .json({
-          code: "CONFLICT",
-          message: "A matching active record already exists.",
-        });
+      res.status(409).json({
+        code: "CONFLICT",
+        message: "A matching active record already exists.",
+      });
       return;
     }
     const status =
@@ -87,35 +83,29 @@ export function createApp(
         ? error.status
         : undefined;
     if (status === 400 || status === 413) {
-      res
-        .status(status)
-        .json({
-          code: "INVALID_REQUEST",
-          message:
-            status === 413
-              ? "Request body is too large."
-              : "Invalid request body.",
-        });
+      res.status(status).json({
+        code: "INVALID_REQUEST",
+        message:
+          status === 413
+            ? "Request body is too large."
+            : "Invalid request body.",
+      });
       return;
     }
     if (
       typeof status === "number" &&
       [401, 403, 404, 409, 422, 503].includes(status)
     ) {
-      res
-        .status(status)
-        .json({
-          code: "REQUEST_FAILED",
-          message: error instanceof Error ? error.message : "Request failed.",
-        });
+      res.status(status).json({
+        code: "REQUEST_FAILED",
+        message: error instanceof Error ? error.message : "Request failed.",
+      });
       return;
     }
-    res
-      .status(500)
-      .json({
-        code: "INTERNAL_ERROR",
-        message: "Unable to process the request.",
-      });
+    res.status(500).json({
+      code: "INTERNAL_ERROR",
+      message: "Unable to process the request.",
+    });
   };
   app.use(handleError);
   return app;

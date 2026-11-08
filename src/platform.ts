@@ -1,3 +1,4 @@
+import { ageAtSession } from "./age.js";
 import { randomUUID, createHash } from "node:crypto";
 import { transaction, type Database, type Connection } from "./database.js";
 export interface Actor {
@@ -44,7 +45,7 @@ export class Platform {
       );
       const p = (
         await c.query(
-          "SELECT id,email,role,active FROM app.profiles WHERE id=$1",
+          "SELECT id,email,role,active,display_name FROM app.profiles WHERE id=$1",
           [id],
         )
       ).rows[0];
@@ -59,7 +60,7 @@ export class Platform {
   }
   children(a: Actor) {
     return this.read(
-      "SELECT id,first_name,surname,birth_date FROM app.children WHERE parent_id=$1 ORDER BY first_name",
+      "SELECT id,first_name,surname,birth_date FROM app.children WHERE parent_id=$1 AND NOT archived ORDER BY first_name",
       [a.id],
     );
   }
@@ -79,7 +80,7 @@ export class Platform {
   }
   bookings(a: Actor) {
     return this.read(
-      `SELECT b.*,COALESCE((SELECT json_agg(json_build_object('id',x.id,'first_name',x.first_name,'surname',x.surname)) FROM app.participants j JOIN app.children x ON x.id=j.child_id WHERE j.booking_id=b.id),'[]') AS children,(SELECT json_agg(p) FROM app.payments p WHERE p.booking_id=b.id) AS payments,(SELECT json_agg(r) FROM app.refunds r WHERE r.booking_id=b.id) AS refunds FROM app.bookings b WHERE $2='admin' OR b.parent_id=$1 OR EXISTS(SELECT 1 FROM app.providers p WHERE p.id=b.provider_id AND p.owner_id=$1) ORDER BY b.created_at DESC LIMIT 200`,
+      `SELECT b.*,COALESCE((SELECT json_agg(json_build_object('id',x->>'id','first_name',x->>'firstName','surname',x->>'surname')) FROM jsonb_array_elements(b.snapshot->'children') x),'[]') AS children,(SELECT json_agg(p) FROM app.payments p WHERE p.booking_id=b.id) AS payments,(SELECT json_agg(r) FROM app.refunds r WHERE r.booking_id=b.id) AS refunds FROM app.bookings b WHERE $2='admin' OR b.parent_id=$1 OR EXISTS(SELECT 1 FROM app.providers p WHERE p.id=b.provider_id AND p.owner_id=$1) ORDER BY b.created_at DESC LIMIT 200`,
       [a.id, a.role],
     );
   }
@@ -131,22 +132,14 @@ export class Platform {
         fail(409, "This session is no longer accepting requests.");
       const kids = (
         await c.query(
-          "SELECT * FROM app.children WHERE parent_id=$1 AND id=ANY($2::uuid[])",
+          "SELECT * FROM app.children WHERE parent_id=$1 AND NOT archived AND id=ANY($2::uuid[]) FOR SHARE",
           [a.id, b.childIds],
         )
       ).rows;
       if (kids.length !== b.childIds.length)
         fail(422, "Select children from your own account.");
       for (const k of kids) {
-        const start = new Date(s.starts_at),
-          dob = new Date(k.birth_date);
-        let age = start.getUTCFullYear() - dob.getUTCFullYear();
-        if (
-          start.getUTCMonth() < dob.getUTCMonth() ||
-          (start.getUTCMonth() === dob.getUTCMonth() &&
-            start.getUTCDate() < dob.getUTCDate())
-        )
-          age--;
+        const age = ageAtSession(k.birth_date, s.starts_at);
         if (age < s.min_age || age > s.max_age)
           fail(422, "A selected child is outside the activity age range.");
       }
@@ -203,6 +196,7 @@ export class Platform {
       reason?: string;
       amountFils?: number;
       reference?: string;
+      sessionId?: string;
     },
   ) {
     return this.command(a, key, { id, ...b }, async (c) => {
@@ -226,13 +220,13 @@ export class Platform {
         due = booking.payment_due_at,
         offer = booking.offer,
         amount = booking.amount_fils;
-      const session = (
+      let session = (
         await c.query("SELECT * FROM app.sessions WHERE id=$1 FOR UPDATE", [
           booking.session_id,
         ])
       ).rows[0];
       const now = new Date();
-      const cutoff = new Date(session.cutoff_at);
+      let cutoff = new Date(session.cutoff_at);
       const hold = async () => {
         if (cutoff <= now) fail(409, "Booking cutoff has passed.");
         if (session.allocated + booking.quantity > session.capacity)
@@ -255,17 +249,65 @@ export class Platform {
         if (state !== "REQUESTED" || new Date(booking.response_due_at) < now)
           fail(409, "Request is no longer actionable.");
         if (!b.amountFils) fail(422, "Enter an offer total.");
+        const target = (
+          await c.query(
+            "SELECT * FROM app.sessions WHERE id=$1 AND activity_id=$2",
+            [b.sessionId || session.id, session.activity_id],
+          )
+        ).rows[0];
+        if (!target || new Date(target.cutoff_at) <= now)
+          fail(409, "The proposed session is unavailable.");
         offer = {
+          sessionId: target.id,
+          startsAt: target.starts_at,
           amountFils: b.amountFils,
           reason: b.reason,
           version: booking.version + 1,
-          expiresAt: session.cutoff_at,
+          expiresAt: target.cutoff_at,
         };
         state = "OFFER_PENDING";
       } else if (b.action === "accept-offer") {
         if (!parent) fail(403, "Parent approval required.");
         if (state !== "OFFER_PENDING" || !offer) fail(409, "No current offer.");
         amount = offer.amountFils;
+        if (offer.sessionId && offer.sessionId !== session.id) {
+          const target = (
+            await c.query(
+              "SELECT * FROM app.sessions WHERE id=$1 AND activity_id=$2 FOR UPDATE",
+              [offer.sessionId, session.activity_id],
+            )
+          ).rows[0];
+          if (!target) fail(409, "Offered session is unavailable.");
+          const ages = (
+            await c.query(
+              "SELECT x.birth_date,a.min_age,a.max_age FROM app.participants j JOIN app.children x ON x.id=j.child_id JOIN app.activities a ON a.id=$2 WHERE j.booking_id=$1",
+              [id, session.activity_id],
+            )
+          ).rows;
+          for (const child of ages) {
+            const age = ageAtSession(child.birth_date, target.starts_at);
+            if (age < child.min_age || age > child.max_age)
+              fail(409, "A child is outside the offered session age range.");
+          }
+          session = target;
+          cutoff = new Date(target.cutoff_at);
+          await c.query(
+            "UPDATE app.participants SET session_id=$2 WHERE booking_id=$1",
+            [id, target.id],
+          );
+          await c.query(
+            "UPDATE app.bookings SET session_id=$2,snapshot=$3 WHERE id=$1",
+            [
+              id,
+              target.id,
+              JSON.stringify({
+                ...booking.snapshot,
+                originalStartsAt: booking.snapshot.startsAt,
+                startsAt: target.starts_at,
+              }),
+            ],
+          );
+        }
         await hold();
         state = "PAYMENT_DUE";
       } else if (b.action === "decline") {
@@ -538,6 +580,222 @@ export class Platform {
       await this.audit(c, a, id, "correction.requested");
       return { id };
     });
+  }
+
+  async updateProfile(a: Actor, name: string) {
+    return transaction(this.db, async (c) => {
+      await c.query("UPDATE app.profiles SET display_name=$2 WHERE id=$1", [
+        a.id,
+        name,
+      ]);
+      await this.audit(c, a, a.id, "profile.updated");
+      return { saved: true };
+    });
+  }
+  async updateChild(
+    a: Actor,
+    id: string,
+    b: { firstName: string; surname: string; birthDate: string } | null,
+  ) {
+    return transaction(this.db, async (c) => {
+      const child = (
+        await c.query(
+          "SELECT id FROM app.children WHERE id=$1 AND parent_id=$2 AND NOT archived FOR UPDATE",
+          [id, a.id],
+        )
+      ).rows[0];
+      if (!child) fail(404, "Child not found.");
+      const active = (
+        await c.query(
+          "SELECT 1 FROM app.participants WHERE child_id=$1 AND active LIMIT 1",
+          [id],
+        )
+      ).rows[0];
+      if (active)
+        fail(
+          409,
+          "This child has an active booking. Contact support before changing their profile.",
+        );
+      if (b)
+        await c.query(
+          "UPDATE app.children SET first_name=$2,surname=$3,birth_date=$4 WHERE id=$1",
+          [id, b.firstName, b.surname, b.birthDate],
+        );
+      else
+        await c.query("UPDATE app.children SET archived=true WHERE id=$1", [
+          id,
+        ]);
+      await this.audit(c, a, id, b ? "child.updated" : "child.archived");
+      return { id };
+    });
+  }
+  managementCatalog(a: Actor) {
+    return this.read(
+      `SELECT a.*,p.name AS provider_name,COALESCE((SELECT json_agg(s ORDER BY starts_at) FROM app.sessions s WHERE s.activity_id=a.id),'[]') AS sessions FROM app.activities a JOIN app.providers p ON p.id=a.provider_id WHERE $2='admin' OR p.owner_id=$1 ORDER BY a.title`,
+      [a.id, a.role],
+    );
+  }
+  async editActivity(a: Actor, id: string, b: Record<string, any>) {
+    this.admin(a);
+    return transaction(this.db, async (c) => {
+      const old = (
+        await c.query("SELECT * FROM app.activities WHERE id=$1 FOR UPDATE", [
+          id,
+        ])
+      ).rows[0];
+      if (!old) fail(404, "Activity not found.");
+      if (old.version !== b.version)
+        fail(409, "This listing changed. Refresh and try again.");
+      await c.query(
+        "UPDATE app.activities SET title=$2,description=$3,category=$4,area=$5,min_age=$6,max_age=$7,price_fils=$8,policy=$9,published=$10,version=version+1 WHERE id=$1",
+        [
+          id,
+          b.title,
+          b.description,
+          b.category,
+          b.area,
+          b.minAge,
+          b.maxAge,
+          b.priceFils,
+          b.policy,
+          b.published,
+        ],
+      );
+      await this.audit(c, a, id, "activity.updated", {
+        previousVersion: old.version,
+      });
+      return { id };
+    });
+  }
+  async addSession(
+    a: Actor,
+    id: string,
+    b: { startsAt: string; cutoffAt: string; capacity: number },
+  ) {
+    this.admin(a);
+    return transaction(this.db, async (c) => {
+      const activity = (
+        await c.query("SELECT id FROM app.activities WHERE id=$1", [id])
+      ).rows[0];
+      if (!activity) fail(404, "Activity not found.");
+      const sessionId = uid();
+      await c.query(
+        "INSERT INTO app.sessions(id,activity_id,starts_at,cutoff_at,capacity) VALUES($1,$2,$3,$4,$5)",
+        [sessionId, id, b.startsAt, b.cutoffAt, b.capacity],
+      );
+      await this.audit(c, a, id, "session.added");
+      return { id: sessionId };
+    });
+  }
+  corrections(a: Actor) {
+    return this.read(
+      `SELECT c.*,a.title,p.name AS provider_name FROM app.corrections c JOIN app.activities a ON a.id=c.activity_id JOIN app.providers p ON p.id=c.provider_id WHERE $2='admin' OR p.owner_id=$1 ORDER BY c.status,c.id`,
+      [a.id, a.role],
+    );
+  }
+  async reviewCorrection(a: Actor, id: string, status: string, note: string) {
+    this.admin(a);
+    return transaction(this.db, async (c) => {
+      const row = (
+        await c.query(
+          "UPDATE app.corrections SET status=$2,reviewed_by=$3,review_note=$4 WHERE id=$1 AND status='pending' RETURNING id",
+          [id, status, a.id, note],
+        )
+      ).rows[0];
+      if (!row) fail(409, "Correction is already reviewed or unavailable.");
+      await this.audit(c, a, id, "correction." + status, { note });
+      return row;
+    });
+  }
+  contents(a?: Actor) {
+    return this.read(
+      "SELECT * FROM app.content WHERE published OR $1=true ORDER BY slug",
+      [a?.role === "admin"],
+    );
+  }
+  async saveContent(
+    a: Actor,
+    slug: string,
+    b: { title: string; body: string; published: boolean; version: number },
+  ) {
+    this.admin(a);
+    return transaction(this.db, async (c) => {
+      await c.query(
+        "INSERT INTO app.content(slug,title,body) VALUES($1,$2,$3) ON CONFLICT DO NOTHING",
+        [slug, b.title, b.body],
+      );
+      const row = (
+        await c.query("SELECT * FROM app.content WHERE slug=$1 FOR UPDATE", [
+          slug,
+        ])
+      ).rows[0];
+      if (row.version !== b.version)
+        fail(409, "Content changed. Reload the latest version.");
+      await c.query(
+        "UPDATE app.content SET title=$2,body=$3,published=$4,version=version+1,updated_at=now() WHERE slug=$1",
+        [slug, b.title, b.body, b.published],
+      );
+      await this.audit(c, a, a.id, "content.saved", { slug });
+      return { slug };
+    });
+  }
+  tickets(a: Actor) {
+    return this.read(
+      `SELECT id,topic,message,status,reply,created_at,updated_at FROM app.support WHERE owner_id=$1 OR $2='admin' ORDER BY created_at DESC LIMIT 200`,
+      [a.id, a.role],
+    );
+  }
+  async ticket(a: Actor, topic: string, message: string) {
+    return transaction(this.db, async (c) => {
+      const id = uid();
+      await c.query(
+        "INSERT INTO app.support(id,owner_id,topic,message) VALUES($1,$2,$3,$4)",
+        [id, a.id, topic, message],
+      );
+      await this.audit(c, a, id, "support.created");
+      return { id };
+    });
+  }
+  async replyTicket(a: Actor, id: string, status: string, reply: string) {
+    this.admin(a);
+    return transaction(this.db, async (c) => {
+      const row = (
+        await c.query(
+          "UPDATE app.support SET status=$2,reply=$3,updated_at=now() WHERE id=$1 RETURNING id",
+          [id, status, reply],
+        )
+      ).rows[0];
+      if (!row) fail(404, "Support request not found.");
+      await this.audit(c, a, id, "support.updated");
+      return row;
+    });
+  }
+  async requestDeletion(a: Actor) {
+    return transaction(this.db, async (c) => {
+      await c.query(
+        "INSERT INTO app.deletion_requests(owner_id) VALUES($1) ON CONFLICT DO NOTHING",
+        [a.id],
+      );
+      await this.audit(c, a, a.id, "account.deletion_requested");
+      return {
+        status: "pending",
+        message:
+          "The team will review outstanding bookings and record-retention requirements.",
+      };
+    });
+  }
+  async history(a: Actor, id: string) {
+    const visible = (
+      await this.read(
+        `SELECT b.id FROM app.bookings b WHERE b.id=$1 AND (b.parent_id=$2 OR $3='admin' OR EXISTS(SELECT 1 FROM app.providers p WHERE p.id=b.provider_id AND p.owner_id=$2))`,
+        [id, a.id, a.role],
+      )
+    )[0];
+    if (!visible) fail(404, "Booking not found.");
+    return this.read(
+      "SELECT action,created_at FROM app.audit WHERE subject_id=$1 ORDER BY created_at",
+      [id],
+    );
   }
   async expire() {
     return transaction(this.db, async (c) => {

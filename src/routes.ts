@@ -34,6 +34,7 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
   r.get("/activities", async (_q, s) => {
     s.json(await p.catalog());
   });
+  r.get("/content", async (_q, s) => s.json(await p.contents()));
   const secure: RequestHandler = async (q, s, next) => {
     try {
       const token = q.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
@@ -92,6 +93,7 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
         ]),
         version: z.number().int().positive(),
         reason: z.string().trim().min(1).max(2000).optional(),
+        sessionId: uuid.optional(),
         amountFils: z.number().int().positive().max(100000000).optional(),
         reference: z.string().trim().min(3).max(200).optional(),
       })
@@ -100,19 +102,17 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
   });
   r.get("/providers", async (_q, s) => s.json(await p.providers(actor(s))));
   r.post("/providers", async (q, s) =>
-    s
-      .status(201)
-      .json(
-        await p.apply(
-          actor(s),
-          z
-            .object({
-              name: text,
-              description: z.string().trim().min(10).max(4000),
-            })
-            .parse(q.body),
-        ),
+    s.status(201).json(
+      await p.apply(
+        actor(s),
+        z
+          .object({
+            name: text,
+            description: z.string().trim().min(10).max(4000),
+          })
+          .parse(q.body),
       ),
+    ),
   );
   r.post("/providers/:id/review", async (q, s) => {
     const b = z
@@ -179,20 +179,129 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
     s.json(await p.suppress(actor(s), uuid.parse(q.params.id))),
   );
   r.post("/admin/campaigns", async (q, s) =>
-    s
-      .status(201)
-      .json(
-        await p.campaign(
-          actor(s),
-          z
-            .object({
-              name: text,
-              template: text,
-              language: z.string().min(2).max(20),
-            })
-            .parse(q.body),
-        ),
+    s.status(201).json(
+      await p.campaign(
+        actor(s),
+        z
+          .object({
+            name: text,
+            template: text,
+            language: z.string().min(2).max(20),
+          })
+          .parse(q.body),
       ),
+    ),
+  );
+
+  r.post("/me", async (q, s) => {
+    const b = z.object({ displayName: text }).parse(q.body);
+    s.json(await p.updateProfile(actor(s), b.displayName));
+  });
+  r.post("/me/deletion-request", async (_q, s) =>
+    s.json(await p.requestDeletion(actor(s))),
+  );
+  r.post("/children/:id/update", async (q, s) => {
+    const b = z
+      .object({ firstName: text, surname: text, birthDate: date })
+      .parse(q.body);
+    s.json(await p.updateChild(actor(s), uuid.parse(q.params.id), b));
+  });
+  r.post("/children/:id/archive", async (q, s) =>
+    s.json(await p.updateChild(actor(s), uuid.parse(q.params.id), null)),
+  );
+  r.get("/manage/activities", async (_q, s) =>
+    s.json(await p.managementCatalog(actor(s))),
+  );
+  r.post("/activities/:id/update", async (q, s) => {
+    const b = z
+      .object({
+        version: z.number().int().positive(),
+        title: text,
+        description: z.string().min(10).max(8000),
+        category: text,
+        area: text,
+        minAge: z.number().int().min(0).max(18),
+        maxAge: z.number().int().min(0).max(18),
+        priceFils: z.number().int().positive().max(10000000),
+        policy: z.string().min(10).max(8000),
+        published: z.boolean(),
+      })
+      .refine((b) => b.maxAge >= b.minAge)
+      .parse(q.body);
+    s.json(await p.editActivity(actor(s), uuid.parse(q.params.id), b));
+  });
+  r.post("/activities/:id/sessions", async (q, s) => {
+    const b = z
+      .object({
+        startsAt: z.string().datetime(),
+        cutoffAt: z.string().datetime(),
+        capacity: z.number().int().min(1).max(10000),
+      })
+      .refine(
+        (b) =>
+          Date.parse(b.cutoffAt) > Date.now() &&
+          Date.parse(b.cutoffAt) < Date.parse(b.startsAt),
+      )
+      .parse(q.body);
+    s.status(201).json(
+      await p.addSession(actor(s), uuid.parse(q.params.id), b),
+    );
+  });
+  r.get("/corrections", async (_q, s) => s.json(await p.corrections(actor(s))));
+  r.post("/corrections/:id/review", async (q, s) => {
+    const b = z
+      .object({
+        status: z.enum(["resolved", "rejected"]),
+        note: z.string().trim().min(5).max(2000),
+      })
+      .parse(q.body);
+    s.json(
+      await p.reviewCorrection(
+        actor(s),
+        uuid.parse(q.params.id),
+        b.status,
+        b.note,
+      ),
+    );
+  });
+  r.get("/manage/content", async (_q, s) => {
+    p.admin(actor(s));
+    s.json(await p.contents(actor(s)));
+  });
+  r.post("/manage/content/:slug", async (q, s) => {
+    const slug = z
+      .enum(["about", "contact", "faq", "terms", "privacy"])
+      .parse(q.params.slug);
+    const b = z
+      .object({
+        title: text,
+        body: z.string().trim().min(10).max(20000),
+        published: z.boolean(),
+        version: z.number().int().positive(),
+      })
+      .parse(q.body);
+    s.json(await p.saveContent(actor(s), slug, b));
+  });
+  r.get("/support", async (_q, s) => s.json(await p.tickets(actor(s))));
+  r.post("/support", async (q, s) => {
+    const b = z
+      .object({ topic: text, message: z.string().trim().min(10).max(4000) })
+      .parse(q.body);
+    s.status(201).json(await p.ticket(actor(s), b.topic, b.message));
+  });
+  r.post("/support/:id/reply", async (q, s) => {
+    const b = z
+      .object({
+        status: z.enum(["open", "in_progress", "resolved"]),
+        reply: z.string().trim().min(5).max(4000),
+      })
+      .parse(q.body);
+    s.json(
+      await p.replyTicket(actor(s), uuid.parse(q.params.id), b.status, b.reply),
+    );
+  });
+  r.get("/bookings/:id/history", async (q, s) =>
+    s.json(await p.history(actor(s), uuid.parse(q.params.id))),
   );
   return r;
 }

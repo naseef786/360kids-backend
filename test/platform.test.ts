@@ -13,6 +13,12 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
       "utf8",
     ),
   );
+  await pg.exec(
+    await readFile(
+      new URL("../database/migrations/002_base_features.sql", import.meta.url),
+      "utf8",
+    ),
+  );
   const db: Database = {
     connect: async () => ({
       query: async (sql, params = []) => {
@@ -178,6 +184,160 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
       true,
     );
     await assert.rejects(() => p.operations(parent), /Admin/);
+
+    // Base account and catalog operations preserve historical agreements.
+    await p.updateProfile(parent, "Synthetic parent");
+    assert.equal(
+      (await p.me(parent.id, "synthetic@example.invalid")).display_name,
+      "Synthetic parent",
+    );
+    await assert.rejects(() => p.updateChild(other, kid.id, null), /not found/);
+    await p.updateChild(parent, kid.id, {
+      firstName: "Updated",
+      surname: "Child",
+      birthDate: "2018-01-01",
+    });
+    assert.equal(
+      (await p.bookings(parent))[0].children[0].first_name,
+      "Synthetic",
+    );
+    const draft = {
+      version: 1,
+      title: "Updated activity",
+      description: "Updated synthetic description",
+      category: "Creative arts",
+      area: "Dubai",
+      minAge: 1,
+      maxAge: 17,
+      priceFils: 12000,
+      policy: "Updated policy for future bookings.",
+      published: false,
+    };
+    await assert.rejects(
+      () => p.editActivity(provider, activity.id, draft),
+      /Admin/,
+    );
+    await p.editActivity(admin, activity.id, draft);
+    assert.equal((await p.catalog()).length, 0);
+    assert.equal((await p.managementCatalog(provider)).length, 1);
+    assert.equal((await p.managementCatalog(other)).length, 0);
+    assert.equal(
+      (await p.bookings(parent))[0].snapshot.title,
+      "Synthetic art session",
+    );
+    await assert.rejects(
+      () => p.editActivity(admin, activity.id, draft),
+      /changed/,
+    );
+    await p.editActivity(admin, activity.id, {
+      ...draft,
+      version: 2,
+      published: true,
+    });
+    const correction = await p.correction(
+      provider,
+      activity.id,
+      "Please update the session description.",
+    );
+    await assert.rejects(
+      () =>
+        p.reviewCorrection(
+          parent,
+          correction.id,
+          "resolved",
+          "Applied manually.",
+        ),
+      /Admin/,
+    );
+    await p.reviewCorrection(
+      admin,
+      correction.id,
+      "resolved",
+      "Applied manually.",
+    );
+    assert.equal((await p.corrections(provider))[0].status, "resolved");
+    assert.equal((await p.corrections(other)).length, 0);
+    await p.saveContent(admin, "about", {
+      title: "About test",
+      body: "Synthetic approved page content.",
+      published: false,
+      version: 1,
+    });
+    assert.equal((await p.contents()).length, 0);
+    await p.saveContent(admin, "about", {
+      title: "About test",
+      body: "Synthetic approved page content.",
+      published: true,
+      version: 2,
+    });
+    assert.equal((await p.contents()).length, 1);
+    await assert.rejects(
+      () =>
+        p.saveContent(provider, "about", {
+          title: "Bad edit",
+          body: "Not authorized",
+          published: true,
+          version: 3,
+        }),
+      /Admin/,
+    );
+    const ticket = await p.ticket(
+      parent,
+      "Profile help",
+      "Synthetic support request for testing.",
+    );
+    assert.equal((await p.tickets(other)).length, 0);
+    await p.replyTicket(
+      admin,
+      ticket.id,
+      "resolved",
+      "Synthetic response recorded.",
+    );
+    assert.equal(
+      (await p.tickets(parent))[0].reply,
+      "Synthetic response recorded.",
+    );
+    assert.equal((await p.history(other, second.id)).length > 0, true);
+    await assert.rejects(() => p.history(parent, second.id), /not found/);
+    assert.equal((await p.requestDeletion(parent)).status, "pending");
+    const alternate = await p.addSession(admin, activity.id, {
+      startsAt: "2030-05-02T12:00:00Z",
+      cutoffAt: "2030-05-01T12:00:00Z",
+      capacity: 1,
+    });
+    const changed = await p.request(parent, "new-date-request", {
+      sessionId: activity.sessionId,
+      childIds: [kid.id],
+      policyAccepted: true,
+    });
+    await p.act(provider, "new-date-offer", changed.id, {
+      action: "offer",
+      version: 1,
+      amountFils: 9500,
+      sessionId: alternate.id,
+      reason: "Synthetic alternative date",
+    });
+    await p.act(parent, "new-date-accept", changed.id, {
+      action: "accept-offer",
+      version: 2,
+    });
+    const moved = (await p.bookings(parent))[0];
+    assert.equal(moved.session_id, alternate.id);
+    assert.equal(
+      new Date(moved.snapshot.startsAt).toISOString(),
+      "2030-05-02T12:00:00.000Z",
+    );
+    await assert.rejects(
+      () => p.updateChild(parent, kid.id, null),
+      /active booking/,
+    );
+    await p.act(parent, "cancel-new-date", changed.id, {
+      action: "cancel",
+      version: 3,
+      reason: "Synthetic withdrawal",
+    });
+    await p.updateChild(parent, kid.id, null);
+    assert.equal((await p.children(parent)).length, 0);
     const { createApp } = await import("../src/app.js");
     const server = createApp("http://localhost:3000", p, async (token) => {
       if (token !== "test-parent")
