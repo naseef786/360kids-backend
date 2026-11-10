@@ -1,77 +1,42 @@
-import { readFile, readdir } from "node:fs/promises";
 import { createHash } from "node:crypto";
-import type { Connection } from "./database.js";
-export class MigrationError extends Error {}
+import { readdir, readFile } from "node:fs/promises";
+import { transaction, type Database } from "./database.js";
 
-export const REQUIRED_MIGRATIONS = [
-  "001_platform.sql",
-  "002_base_features.sql",
-  "003_notifications.sql",
-  "004_private_access_indexes.sql",
-] as const;
-
-export async function readMigrations() {
-  const folder = new URL("../database/migrations/", import.meta.url);
-  return Promise.all(
-    (await readdir(folder))
-      .filter((name) => /^\d+_[a-z_]+\.sql$/.test(name))
-      .sort()
-      .map(async (name) => {
-        const sql = await readFile(new URL(name, folder), "utf8");
-        return {
-          name,
-          sql,
-          checksum: createHash("sha256").update(sql).digest("hex"),
-        };
-      }),
-  );
-}
-
-export async function applyMigrations(client: Connection) {
-  const migrations = await readMigrations(),
-    applied: string[] = [];
-  await client.query("BEGIN");
-  try {
-    await client.query("SELECT pg_advisory_xact_lock(3602026)");
-    await client.query("CREATE SCHEMA IF NOT EXISTS app");
-    await client.query("REVOKE ALL ON SCHEMA app FROM PUBLIC");
-    const existing = (
-      await client.query(
-        "SELECT to_regclass('app.migrations') IS NOT NULL AS ledger, EXISTS(SELECT 1 FROM information_schema.tables WHERE table_schema='app') AS tables",
-      )
-    ).rows[0];
-    if (!existing.ledger && existing.tables)
-      throw new MigrationError(
-        "Unmanaged application schema: review and baseline existing tables before migrating.",
-      );
-    await client.query(
-      "CREATE TABLE IF NOT EXISTS app.migrations(name text PRIMARY KEY,checksum text NOT NULL,applied_at timestamptz NOT NULL DEFAULT now())",
+export async function migrate(db: Database) {
+  const directory = new URL("../database/migrations/", import.meta.url);
+  const files = (await readdir(directory))
+    .filter((name) => /^\d+_[a-z0-9_]+\.sql$/.test(name))
+    .sort();
+  return transaction(db, async (connection) => {
+    // Serialize deploys on real PostgreSQL; each migration and its ledger entry commit together.
+    await connection.query("SELECT pg_advisory_xact_lock(3604000)");
+    await connection.query("CREATE SCHEMA IF NOT EXISTS app");
+    await connection.query("REVOKE ALL ON SCHEMA app FROM PUBLIC");
+    await connection.query(
+      "CREATE TABLE IF NOT EXISTS app.schema_migrations(name text PRIMARY KEY, checksum text NOT NULL, applied_at timestamptz NOT NULL DEFAULT now())",
     );
-    for (const migration of migrations) {
-      const row = (
-        await client.query(
-          "SELECT checksum FROM app.migrations WHERE name=$1",
-          [migration.name],
+    const applied: string[] = [];
+    for (const name of files) {
+      const sql = await readFile(new URL(name, directory), "utf8");
+      const checksum = createHash("sha256").update(sql).digest("hex");
+      const previous = (
+        await connection.query(
+          "SELECT checksum FROM app.schema_migrations WHERE name=$1",
+          [name],
         )
       ).rows[0];
-      if (row) {
-        if (row.checksum !== migration.checksum)
-          throw new MigrationError(
-            "Applied migration changed: " + migration.name,
-          );
-      } else {
-        await client.query(migration.sql);
-        await client.query(
-          "INSERT INTO app.migrations(name,checksum) VALUES($1,$2)",
-          [migration.name, migration.checksum],
-        );
-        applied.push(migration.name);
+      if (previous) {
+        if (previous.checksum !== checksum)
+          throw new Error(`Applied migration changed: ${name}`);
+        continue;
       }
+      await connection.query(sql);
+      await connection.query(
+        "INSERT INTO app.schema_migrations(name,checksum) VALUES($1,$2)",
+        [name, checksum],
+      );
+      applied.push(name);
     }
-    await client.query("COMMIT");
     return applied;
-  } catch (error) {
-    await client.query("ROLLBACK");
-    throw error;
-  }
+  });
 }

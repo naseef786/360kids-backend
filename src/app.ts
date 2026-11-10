@@ -16,10 +16,6 @@ export function createApp(
   app.disable("x-powered-by");
   app.use(helmet());
   app.use(cors({ origin: webOrigin }));
-  app.use(["/v1", "/health/ready"], (_req, res, next) => {
-    res.setHeader("Cache-Control", "no-store");
-    next();
-  });
   app.use(
     "/v1",
     rateLimit({
@@ -34,78 +30,54 @@ export function createApp(
   app.get("/health/live", (_req, res) =>
     res.json({ status: "ok", service: "360kids-backend" }),
   );
-  let service = platform;
-  let router = platform ? routes(platform, auth) : undefined;
-  const getService = () =>
-    (service ??= new Platform(
-      database(),
-      process.env.FINANCE_WORKFLOW_ENABLED === "true",
-    ));
-  let probe:
-    | {
-        until: number;
-        result: Promise<{ database: boolean; authentication: boolean }>;
-      }
-    | undefined;
-  const readiness = () => {
-    if (!probe || probe.until <= Date.now()) {
-      const result = (async () => {
-        let ready = false;
-        try {
-          ready = await getService().ready();
-        } catch {
-          /* Never reveal database errors publicly. */
-        }
-        return {
-          database: ready,
-          authentication: Boolean(
-            auth ||
-              (process.env.SUPABASE_URL &&
-                process.env.SUPABASE_PUBLISHABLE_KEY),
-          ),
-        };
-      })();
-      // Keep concurrent health calls on the same in-flight database query.
-      // The cache window starts after completion, including connection failures.
-      const entry = { until: Infinity, result };
-      probe = entry;
-      void result.then(() => {
-        entry.until = Date.now() + 2000;
-      });
-    }
-    return probe.result;
-  };
-  app.get("/health/ready", async (_req, res) => {
-    const checks = await readiness(),
-      ready = checks.database && checks.authentication;
-    res
-      .status(ready ? 200 : 503)
-      .json({ status: ready ? "ready" : "not_ready", checks });
-  });
-  app.get("/v1/status", async (_req, res) => {
-    const checks = await readiness(),
-      ready = checks.database && checks.authentication;
+  app.get("/v1/status", (_req, res) =>
     res.json({
       version: "0.1.0",
-      stage:
-        process.env.NODE_ENV === "production" ? "production" : "development",
-      bookingsAvailable: ready,
-      financeEnabled: ready && Boolean(service?.financeEnabled),
+      stage: "development",
+      bookingsAvailable: Boolean(platform || process.env.DATABASE_URL),
+      financeEnabled: Boolean(platform?.financeEnabled),
       whatsappSendingAvailable: false,
-    });
-  });
-  app.use("/v1", async (req, res, next) => {
+      financeWorkflowEnabled: process.env.FINANCE_WORKFLOW_ENABLED === "true",
+    }),
+  );
+  let service = platform;
+  let router: ReturnType<typeof routes> | undefined;
+  app.get("/health/ready", async (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const authenticationConfigured = Boolean(
+      auth ||
+      (process.env.SUPABASE_URL && process.env.SUPABASE_PUBLISHABLE_KEY),
+    );
     try {
-      if (!(await readiness()).database) {
-        res
-          .status(503)
-          .json({
-            code: "SERVICE_UNAVAILABLE",
-            message: "Database setup is not ready. Please try again later.",
-          });
-        return;
-      }
-      router ??= routes(getService(), auth);
+      service ??= new Platform(
+        database(),
+        process.env.FINANCE_WORKFLOW_ENABLED === "true",
+      );
+      await service.read(
+        "SELECT m.provider_id,c.age_years FROM app.provider_memberships m LEFT JOIN app.children c ON false LIMIT 1",
+      );
+      res.status(authenticationConfigured ? 200 : 503).json({
+        status: authenticationConfigured ? "ready" : "not_ready",
+        database: true,
+        authenticationConfigured,
+      });
+    } catch {
+      res
+        .status(503)
+        .json({
+          status: "not_ready",
+          database: false,
+          authenticationConfigured,
+        });
+    }
+  });
+  app.use("/v1", (req, res, next) => {
+    try {
+      service ??= new Platform(
+        database(),
+        process.env.FINANCE_WORKFLOW_ENABLED === "true",
+      );
+      router ??= routes(service, auth);
       router(req, res, next);
     } catch (e) {
       next(e);
@@ -120,37 +92,6 @@ export function createApp(
     res,
     _next,
   ) => {
-    const code =
-      typeof error === "object" && error !== null && "code" in error
-        ? String(error.code)
-        : "";
-    if (
-      /^(08|53|57)/.test(code) ||
-      [
-        "ECONNREFUSED",
-        "ECONNRESET",
-        "ETIMEDOUT",
-        "EAI_AGAIN",
-        "ENOTFOUND",
-        "42P01",
-        "42703",
-      ].includes(code)
-    ) {
-      res.status(503).json({
-        code: "SERVICE_UNAVAILABLE",
-        message:
-          "The database service is temporarily unavailable. Please try again.",
-      });
-      return;
-    }
-    if (["40001", "40P01"].includes(code)) {
-      res.status(409).json({
-        code: "CONFLICT",
-        message:
-          "Another operation changed this request. Refresh and try again.",
-      });
-      return;
-    }
     if (error instanceof ZodError) {
       res.status(422).json({
         code: "VALIDATION_ERROR",
@@ -166,10 +107,7 @@ export function createApp(
     ) {
       res.status(409).json({
         code: "CONFLICT",
-        message:
-          "constraint" in error && error.constraint === "active_child_session"
-            ? "A selected child already has an active request for this session. Check your bookings."
-            : "A matching active record already exists.",
+        message: "A matching active record already exists.",
       });
       return;
     }

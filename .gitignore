@@ -1,5 +1,8 @@
 node_modules/
 .env
+.e2e-accounts.json
+.e2e-result.json
+.e2e-finance-result.json
 .env.*
 !.env.example
 .next/

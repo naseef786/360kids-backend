@@ -7,13 +7,13 @@
     "node": ">=24 <25"
   },
   "scripts": {
-    "dev": "node --watch --import tsx src/server.ts",
+    "dev": "tsx watch src/server.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node dist/server.js",
     "typecheck": "tsc --noEmit",
-    "test": "node --import tsx --test test/app.test.ts test/whatsapp-policy.test.ts test/platform.test.ts test/age.test.ts test/realtime.test.ts test/audit.test.ts test/auth.test.ts test/http-flow.test.ts",
-    "db:migrate": "node --import tsx scripts/migrate.ts",
-    "worker": "node --import tsx src/worker.ts"
+    "test": "node --import tsx --test test/app.test.ts test/whatsapp-policy.test.ts test/platform.test.ts test/backend.test.ts test/migrations.test.ts test/eligibility.test.ts test/database.test.ts",
+    "db:migrate": "tsx scripts/migrate.ts",
+    "worker": "tsx src/worker.ts"
   },
   "dependencies": {
     "cors": "2.8.6",

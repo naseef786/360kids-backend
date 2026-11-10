@@ -12,6 +12,9 @@ test("API starter reports its limits and handles invalid requests", async () => 
     assert.equal(health.status, 200);
     assert.equal(health.headers.get("x-powered-by"), null);
     assert.equal((await health.json()).status, "ok");
+    const ready = await fetch(`${origin}/health/ready`);
+    assert.equal(ready.status, 503);
+    assert.equal((await ready.json()).database, false);
     const status = await fetch(`${origin}/v1/status`);
     assert.deepEqual(await status.json(), {
       version: "0.1.0",
@@ -19,6 +22,7 @@ test("API starter reports its limits and handles invalid requests", async () => 
       bookingsAvailable: false,
       financeEnabled: false,
       whatsappSendingAvailable: false,
+      financeWorkflowEnabled: false,
     });
     const readiness = await fetch(`${origin}/health/ready`);
     assert.equal(readiness.status, 503);
