@@ -2,7 +2,7 @@
 
 Use TypeScript and the existing repository conventions. Keep changes focused and test the normal flow and relevant failures.
 
-This is an initial scaffold, not a live booking system. Mark sample data and unfinished functionality clearly. Do not collect real child data, accept payments, or send messages from this scaffold.
+This is a development implementation; production readiness is tracked in docs/IMPLEMENTATION_STATUS.md. Mark sample data and unfinished functionality clearly. Do not collect real child data, accept payments, or send messages from this scaffold.
 
 Business permissions, amounts, deadlines and booking status changes belong in the backend. A submitted request is not confirmed. Keep booking, payment, refund and subscription records separate.
 
