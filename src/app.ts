@@ -36,16 +36,48 @@ export function createApp(
       stage: "development",
       bookingsAvailable: Boolean(platform || process.env.DATABASE_URL),
       whatsappSendingAvailable: false,
+      financeWorkflowEnabled: process.env.FINANCE_WORKFLOW_ENABLED === "true",
     }),
   );
   let service = platform;
+  let router: ReturnType<typeof routes> | undefined;
+  app.get("/health/ready", async (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const authenticationConfigured = Boolean(
+      auth ||
+      (process.env.SUPABASE_URL && process.env.SUPABASE_PUBLISHABLE_KEY),
+    );
+    try {
+      service ??= new Platform(
+        database(),
+        process.env.FINANCE_WORKFLOW_ENABLED === "true",
+      );
+      await service.read(
+        "SELECT m.provider_id,c.age_years FROM app.provider_memberships m LEFT JOIN app.children c ON false LIMIT 1",
+      );
+      res.status(authenticationConfigured ? 200 : 503).json({
+        status: authenticationConfigured ? "ready" : "not_ready",
+        database: true,
+        authenticationConfigured,
+      });
+    } catch {
+      res
+        .status(503)
+        .json({
+          status: "not_ready",
+          database: false,
+          authenticationConfigured,
+        });
+    }
+  });
   app.use("/v1", (req, res, next) => {
     try {
       service ??= new Platform(
         database(),
         process.env.FINANCE_WORKFLOW_ENABLED === "true",
       );
-      routes(service, auth)(req, res, next);
+      router ??= routes(service, auth);
+      router(req, res, next);
     } catch (e) {
       next(e);
     }
@@ -60,12 +92,10 @@ export function createApp(
     _next,
   ) => {
     if (error instanceof ZodError) {
-      res
-        .status(422)
-        .json({
-          code: "VALIDATION_ERROR",
-          message: error.issues.map((x) => x.message).join(" "),
-        });
+      res.status(422).json({
+        code: "VALIDATION_ERROR",
+        message: error.issues.map((x) => x.message).join(" "),
+      });
       return;
     }
     if (
@@ -74,12 +104,10 @@ export function createApp(
       "code" in error &&
       error.code === "23505"
     ) {
-      res
-        .status(409)
-        .json({
-          code: "CONFLICT",
-          message: "A matching active record already exists.",
-        });
+      res.status(409).json({
+        code: "CONFLICT",
+        message: "A matching active record already exists.",
+      });
       return;
     }
     const status =
@@ -87,35 +115,29 @@ export function createApp(
         ? error.status
         : undefined;
     if (status === 400 || status === 413) {
-      res
-        .status(status)
-        .json({
-          code: "INVALID_REQUEST",
-          message:
-            status === 413
-              ? "Request body is too large."
-              : "Invalid request body.",
-        });
+      res.status(status).json({
+        code: "INVALID_REQUEST",
+        message:
+          status === 413
+            ? "Request body is too large."
+            : "Invalid request body.",
+      });
       return;
     }
     if (
       typeof status === "number" &&
       [401, 403, 404, 409, 422, 503].includes(status)
     ) {
-      res
-        .status(status)
-        .json({
-          code: "REQUEST_FAILED",
-          message: error instanceof Error ? error.message : "Request failed.",
-        });
+      res.status(status).json({
+        code: "REQUEST_FAILED",
+        message: error instanceof Error ? error.message : "Request failed.",
+      });
       return;
     }
-    res
-      .status(500)
-      .json({
-        code: "INTERNAL_ERROR",
-        message: "Unable to process the request.",
-      });
+    res.status(500).json({
+      code: "INTERNAL_ERROR",
+      message: "Unable to process the request.",
+    });
   };
   app.use(handleError);
   return app;

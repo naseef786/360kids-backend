@@ -1,23 +1,16 @@
 import "dotenv/config";
-import { readFile } from "node:fs/promises";
-import pg from "pg";
-if (!process.env.DATABASE_URL)
-  throw new Error("Set DATABASE_URL to the intended development database.");
-const client = new pg.Client({ connectionString: process.env.DATABASE_URL });
-await client.connect();
+import { database } from "../src/database.js";
+import { migrate } from "../src/migrations.js";
+import type pg from "pg";
+
+const pool = database() as pg.Pool;
 try {
-  await client.query("BEGIN");
-  await client.query(
-    await readFile(
-      new URL("../database/migrations/001_platform.sql", import.meta.url),
-      "utf8",
-    ),
+  const applied = await migrate(pool);
+  console.log(
+    applied.length
+      ? `Applied ${applied.length} database migrations.`
+      : "Database migrations are up to date.",
   );
-  await client.query("COMMIT");
-  console.log("Platform schema applied.");
-} catch (e) {
-  await client.query("ROLLBACK");
-  throw e;
 } finally {
-  await client.end();
+  await pool.end();
 }
