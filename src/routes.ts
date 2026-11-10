@@ -2,6 +2,7 @@ import { NotificationService } from "./notifications.js";
 import { Router, type RequestHandler } from "express";
 import { z } from "zod";
 import { Platform, fail, type Actor } from "./platform.js";
+import { dubaiCalendarDate } from "./age.js";
 const uuid = z.string().uuid();
 const text = z.string().trim().min(1).max(200);
 const date = z
@@ -11,7 +12,7 @@ const date = z
     (s) =>
       !Number.isNaN(Date.parse(s)) &&
       new Date(s).toISOString().slice(0, 10) === s &&
-      new Date(s) <= new Date(),
+      s <= dubaiCalendarDate(new Date()),
     "Invalid birth date",
   );
 export type Authenticator = (
@@ -21,13 +22,30 @@ export const authenticate: Authenticator = async (token) => {
   const origin = process.env.SUPABASE_URL,
     key = process.env.SUPABASE_PUBLISHABLE_KEY;
   if (!origin || !key) fail(503, "Supabase authentication is not configured.");
-  const response = await fetch(`${origin}/auth/v1/user`, {
-    headers: { apikey: key, Authorization: `Bearer ${token}` },
-    signal: AbortSignal.timeout(8000),
-  });
+  let response: Response;
+  try {
+    response = await fetch(new URL("/auth/v1/user", origin), {
+      headers: { apikey: key, Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(8000),
+    });
+  } catch {
+    fail(503, "Sign-in verification is temporarily unavailable.");
+  }
+  if (response.status >= 500 || response.status === 429)
+    fail(503, "Sign-in verification is temporarily unavailable.");
   if (!response.ok) fail(401, "Please sign in again.");
-  const user = (await response.json()) as { id: string; email?: string };
-  if (!user.id || !user.email) fail(401, "Verified account required.");
+  let user: { id: string; email?: string };
+  try {
+    user = await response.json();
+  } catch {
+    fail(503, "Sign-in verification is temporarily unavailable.");
+  }
+  if (!user || typeof user !== "object")
+    fail(503, "Sign-in verification is temporarily unavailable.");
+  if (!uuid.safeParse(user.id).success)
+    fail(503, "Sign-in verification is temporarily unavailable.");
+  if (typeof user.email !== "string" || !user.email)
+    fail(401, "Verified account required.");
   return { id: user.id, email: user.email };
 };
 export function routes(p: Platform, auth: Authenticator = authenticate) {
@@ -66,7 +84,13 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
       .parse(q.body);
     s.status(201).json(await p.addChild(actor(s), b));
   });
-  r.get("/bookings", async (_q, s) => s.json(await p.bookings(actor(s))));
+  r.get("/bookings", async (q, s) => {
+    const scope = z
+      .enum(["all", "family", "provider"])
+      .default("all")
+      .parse(q.query.scope);
+    s.json(await p.bookings(actor(s), scope));
+  });
   r.post("/bookings", async (q, s) => {
     const b = z
       .object({

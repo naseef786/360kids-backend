@@ -4,7 +4,7 @@ The API hosts authenticated Socket.IO connections on the same port as HTTP, at `
 
 ## Deployment
 
-1. Configure `DATABASE_URL`, Supabase Auth and `WEB_ORIGIN` for the intended environment. Run `npm run db:migrate` before starting this version; migration 003 adds notification records and indexes.
+1. Configure `DATABASE_URL`, Supabase Auth and `WEB_ORIGIN` for the intended environment. Run `npm run db:migrate` before starting this version; migration 003 adds notification records; migration 004 protects browser-role access and adds query indexes.
 2. Run `npm start` as a persistent Node service. Forward both WebSocket upgrades and HTTP polling requests for `/socket.io` to this service. Set the public frontend API URL to the API origin, without `/v1`.
 3. Use HTTPS/WSS in deployed environments. `WEB_ORIGIN` must exactly match the frontend origin. Browser connections from other origins are rejected; native clients without an Origin still require authentication.
 4. With multiple API instances, use session affinity for Socket.IO HTTP polling. Every instance independently polls PostgreSQL for its connected users, so committed changes from another API instance or the expiry worker are detected. The current implementation does not use a Redis room adapter. Measure database and connection load before scaling.
@@ -41,3 +41,7 @@ Socket signals are transient. Reconnect and tab focus trigger authenticated data
 Automated integration tests run actual HTTP/Socket.IO connections against synthetic embedded PostgreSQL records. They cover invalid tokens/origins, client identity/room forgery, tenant isolation, committed request delivery, rollback, reconnect, read state across tabs, demoted admin visibility and disabled-account disconnects. The normal browser polling/upgrade transport and WebSocket-only clients are covered.
 
 Hosted Supabase configuration, reverse-proxy behavior, multi-instance session affinity/load, hosted PostgreSQL concurrency and browser/device interaction still need staging verification. No live client notification has been sent and no deployment is implied by source checks. Retention and account-deletion processing must include saved notifications in the final approved policy.
+
+## Audit follow-up
+
+Connection caps now include pending authenticated handshakes. Revalidation groups matching tokens and runs batches of at most 16. Integration tests cover simultaneous admission, slot reuse and revoked identities. Notification responses contain a server-derived workspace so a partner’s family bookings open the family view. Reconnect/pagination requests are guarded against stale responses. Apply migration 004 before rollout; see `AUDIT_2026-11-10.md` for verification limits.

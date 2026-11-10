@@ -1,42 +1,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { readFile } from "node:fs/promises";
-import { PGlite } from "@electric-sql/pglite";
 import { Platform, type Actor } from "../src/platform.js";
-import type { Database } from "../src/database.js";
 import { randomUUID } from "node:crypto";
+import { createTestDatabase } from "./helpers.js";
 test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppression", async () => {
-  const pg = new PGlite();
-  await pg.exec(
-    await readFile(
-      new URL("../database/migrations/001_platform.sql", import.meta.url),
-      "utf8",
-    ),
-  );
-  await pg.exec(
-    await readFile(
-      new URL("../database/migrations/002_base_features.sql", import.meta.url),
-      "utf8",
-    ),
-  );
-  await pg.exec(
-    await readFile(
-      new URL("../database/migrations/003_notifications.sql", import.meta.url),
-      "utf8",
-    ),
-  );
-  const db: Database = {
-    connect: async () => ({
-      query: async (sql, params = []) => {
-        const r = await pg.query(sql, params);
-        return {
-          rows: r.rows as Record<string, any>[],
-          rowCount: r.affectedRows,
-        };
-      },
-      release() {},
-    }),
-  };
+  const { pg, db } = await createTestDatabase();
   const p = new Platform(db, true);
   const parent: Actor = { id: randomUUID(), role: "parent" },
     other: Actor = { id: randomUUID(), role: "parent" },

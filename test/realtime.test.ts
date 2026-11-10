@@ -1,15 +1,13 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { readFile } from "node:fs/promises";
 import { randomUUID } from "node:crypto";
-import { PGlite } from "@electric-sql/pglite";
 import { io, type Socket } from "socket.io-client";
 import { Platform, type Actor } from "../src/platform.js";
 import { NotificationService } from "../src/notifications.js";
 import { attachRealtime } from "../src/realtime.js";
 import { createApp } from "../src/app.js";
-import type { Database } from "../src/database.js";
+import { createTestDatabase } from "./helpers.js";
 function event(socket: Socket, name: string) {
   return new Promise<any>((resolve, reject) => {
     const timer = setTimeout(() => {
@@ -27,40 +25,7 @@ test(
   "authenticated real-time delivery, tenant isolation, read state, reconnect and account revocation",
   { timeout: 25000 },
   async () => {
-    const pg = new PGlite();
-    for (const file of [
-      "001_platform.sql",
-      "002_base_features.sql",
-      "003_notifications.sql",
-    ])
-      await pg.exec(
-        await readFile(
-          new URL("../database/migrations/" + file, import.meta.url),
-          "utf8",
-        ),
-      );
-    // Serialize embedded connections: a poll must not see a transaction's uncommitted rows.
-    let tail = Promise.resolve();
-    const db: Database = {
-      async connect() {
-        const previous = tail;
-        let unlock!: () => void;
-        tail = new Promise<void>((resolve) => {
-          unlock = resolve;
-        });
-        await previous;
-        return {
-          query: async (sql, params = []) => {
-            const r = await pg.query(sql, params);
-            return {
-              rows: r.rows as Record<string, any>[],
-              rowCount: r.affectedRows,
-            };
-          },
-          release: unlock,
-        };
-      },
-    };
+    const { pg, db } = await createTestDatabase();
     const p = new Platform(db),
       notifications = new NotificationService(db);
     const parent: Actor = { id: randomUUID(), role: "parent" },
@@ -250,6 +215,46 @@ test(
       await gateway.sweep();
       await Promise.all(readSignals);
       assert.equal((await notifications.list(provider)).unread, 0);
+      // All handshakes start together; pending authenticated connections count
+      // toward the cap before Socket.IO has added them to recipient rooms.
+      const extra = Array.from({ length: 10 }, () => make("other"));
+      const results = await Promise.all(
+        extra.map(
+          (socket) =>
+            new Promise<boolean>((resolve, reject) => {
+              const timeout = setTimeout(
+                () => reject(new Error("Connection limit test timed out")),
+                4000,
+              );
+              socket.once("connect", () => {
+                clearTimeout(timeout);
+                resolve(true);
+              });
+              socket.once("connect_error", () => {
+                clearTimeout(timeout);
+                resolve(false);
+              });
+              socket.connect();
+            }),
+        ),
+      );
+      assert.equal(results.filter(Boolean).length, 9);
+      assert.equal(results.filter((value) => !value).length, 1);
+      await Promise.all(
+        extra
+          .filter((socket) => socket.connected)
+          .map(
+            (socket) =>
+              new Promise<void>((resolve) => {
+                const serverSocket = gateway.io.sockets.sockets.get(
+                  socket.id!,
+                )!;
+                serverSocket.once("disconnect", () => resolve());
+                socket.disconnect();
+              }),
+          ),
+      );
+      await connect(make("other"));
       await p.read("UPDATE app.profiles SET role='parent' WHERE id=$1", [
         admin.id,
       ]);
@@ -263,6 +268,10 @@ test(
       ]);
       await gateway.sweep();
       assert.equal(await disconnected, "io server disconnect");
+      const revoked = event(family, "disconnect");
+      delete actors.parent;
+      await gateway.revalidate();
+      assert.equal(await revoked, "io server disconnect");
     } finally {
       for (const socket of sockets) socket.disconnect();
       await gateway.close();

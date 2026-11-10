@@ -1,4 +1,5 @@
 import { recordNotifications } from "./notifications.js";
+import { readMigrations } from "./migrations.js";
 import { ageAtSession } from "./age.js";
 import { randomUUID, createHash } from "node:crypto";
 import { transaction, type Database, type Connection } from "./database.js";
@@ -15,6 +16,19 @@ export class Platform {
     readonly db: Database,
     readonly financeEnabled = false,
   ) {}
+  async ready() {
+    const migrations = await readMigrations();
+    const rows = await this.read(
+      "SELECT name,checksum FROM app.migrations WHERE name=ANY($1::text[])",
+      [migrations.map((m) => m.name)],
+    );
+    return (
+      rows.length === migrations.length &&
+      migrations.every((m) =>
+        rows.some((row) => row.name === m.name && row.checksum === m.checksum),
+      )
+    );
+  }
   async read(sql: string, params: unknown[] = []) {
     const c = await this.db.connect();
     try {
@@ -43,7 +57,7 @@ export class Platform {
   async me(id: string, email: string) {
     return transaction(this.db, async (c) => {
       await c.query(
-        "INSERT INTO app.profiles(id,email) VALUES($1,$2) ON CONFLICT(id) DO NOTHING",
+        "INSERT INTO app.profiles(id,email) VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET email=EXCLUDED.email WHERE app.profiles.email IS DISTINCT FROM EXCLUDED.email",
         [id, email],
       );
       const p = (
@@ -51,19 +65,23 @@ export class Platform {
           "SELECT id,email,role,active,display_name FROM app.profiles WHERE id=$1",
           [id],
         )
-      ).rows[0];
+      ).rows[0] as Actor & {
+        email: string;
+        active: boolean;
+        display_name: string;
+      };
       if (!p.active) fail(403, "Account is disabled.");
       return p;
     });
   }
   catalog() {
     return this.read(
-      `SELECT a.*,p.name AS provider_name,COALESCE((SELECT json_agg(s ORDER BY starts_at) FROM app.sessions s WHERE s.activity_id=a.id AND cutoff_at>now()),'[]') AS sessions FROM app.activities a JOIN app.providers p ON p.id=a.provider_id WHERE a.published AND p.status='approved' ORDER BY a.title`,
+      `SELECT a.*,p.name AS provider_name,COALESCE((SELECT json_agg(json_build_object('id',s.id,'starts_at',s.starts_at,'cutoff_at',s.cutoff_at) ORDER BY starts_at) FROM app.sessions s WHERE s.activity_id=a.id AND cutoff_at>now()),'[]') AS sessions FROM app.activities a JOIN app.providers p ON p.id=a.provider_id WHERE a.published AND p.status='approved' ORDER BY a.title`,
     );
   }
   children(a: Actor) {
     return this.read(
-      "SELECT id,first_name,surname,birth_date FROM app.children WHERE parent_id=$1 AND NOT archived ORDER BY first_name",
+      "SELECT id,first_name,surname,birth_date::text AS birth_date FROM app.children WHERE parent_id=$1 AND NOT archived ORDER BY first_name",
       [a.id],
     );
   }
@@ -81,10 +99,19 @@ export class Platform {
       return { id };
     });
   }
-  bookings(a: Actor) {
+  bookings(a: Actor, scope: "all" | "family" | "provider" = "all") {
     return this.read(
-      `SELECT b.*,COALESCE((SELECT json_agg(json_build_object('id',x->>'id','first_name',x->>'firstName','surname',x->>'surname')) FROM jsonb_array_elements(b.snapshot->'children') x),'[]') AS children,(SELECT json_agg(p) FROM app.payments p WHERE p.booking_id=b.id) AS payments,(SELECT json_agg(r) FROM app.refunds r WHERE r.booking_id=b.id) AS refunds FROM app.bookings b WHERE $2='admin' OR b.parent_id=$1 OR EXISTS(SELECT 1 FROM app.providers p WHERE p.id=b.provider_id AND p.owner_id=$1) ORDER BY b.created_at DESC LIMIT 200`,
-      [a.id, a.role],
+      `SELECT b.*,COALESCE((SELECT json_agg(json_build_object('id',x->>'id','first_name',x->>'firstName','surname',x->>'surname')) FROM jsonb_array_elements(b.snapshot->'children') x),'[]') AS children,
+      (SELECT json_agg(p) FROM app.payments p WHERE p.booking_id=b.id) AS payments,
+      (SELECT json_agg(r) FROM app.refunds r WHERE r.booking_id=b.id) AS refunds
+      FROM app.bookings b WHERE
+      ($3='family' AND b.parent_id=$1) OR
+      ($3='provider' AND ($2='admin' OR ($2='provider' AND EXISTS(SELECT 1 FROM app.providers p WHERE p.id=b.provider_id AND p.owner_id=$1)))) OR
+      ($3='all' AND ($2='admin' OR b.parent_id=$1 OR ($2='provider' AND EXISTS(SELECT 1 FROM app.providers p WHERE p.id=b.provider_id AND p.owner_id=$1))))
+      ORDER BY (b.state IN ('REQUESTED','OFFER_PENDING','PAYMENT_DUE','PAYMENT_CHECKING','CONFIRMED')) DESC,
+      CASE b.state WHEN 'REQUESTED' THEN b.response_due_at WHEN 'OFFER_PENDING' THEN (b.offer->>'expiresAt')::timestamptz WHEN 'PAYMENT_DUE' THEN b.payment_due_at WHEN 'PAYMENT_CHECKING' THEN b.created_at END ASC NULLS LAST,
+      b.created_at DESC,b.id DESC LIMIT 200`,
+      [a.id, a.role, scope],
     );
   }
   async command<T>(
@@ -135,7 +162,7 @@ export class Platform {
         fail(409, "This session is no longer accepting requests.");
       const kids = (
         await c.query(
-          "SELECT * FROM app.children WHERE parent_id=$1 AND NOT archived AND id=ANY($2::uuid[]) FOR SHARE",
+          "SELECT id,first_name,surname,birth_date::text AS birth_date FROM app.children WHERE parent_id=$1 AND NOT archived AND id=ANY($2::uuid[]) ORDER BY id FOR SHARE",
           [a.id, b.childIds],
         )
       ).rows;
@@ -208,12 +235,16 @@ export class Platform {
       ).rows[0];
       if (!booking) fail(404, "Booking not found.");
       const owner = (
-        await c.query("SELECT owner_id,status FROM app.providers WHERE id=$1", [
-          booking.provider_id,
-        ])
+        await c.query(
+          "SELECT owner_id,status FROM app.providers WHERE id=$1 FOR SHARE",
+          [booking.provider_id],
+        )
       ).rows[0];
       const parent = booking.parent_id === a.id,
-        provider = owner?.owner_id === a.id && owner.status === "approved",
+        provider =
+          a.role === "provider" &&
+          owner?.owner_id === a.id &&
+          owner.status === "approved",
         admin = a.role === "admin";
       if (!parent && !provider && !admin) fail(404, "Booking not found.");
       if (b.version !== booking.version)
@@ -223,14 +254,30 @@ export class Platform {
         due = booking.payment_due_at,
         offer = booking.offer,
         amount = booking.amount_fils;
-      let session = (
-        await c.query("SELECT * FROM app.sessions WHERE id=$1 FOR UPDATE", [
+      // Lock every affected session in one global order. Opposite-direction
+      // offers must not each hold one session while waiting for the other.
+      const sessionIds = [
+        ...new Set([
           booking.session_id,
-        ])
-      ).rows[0];
+          ...(b.action === "accept-offer" && booking.offer?.sessionId
+            ? [booking.offer.sessionId]
+            : []),
+        ]),
+      ].sort();
+      const sessions = (
+        await c.query(
+          "SELECT * FROM app.sessions WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+          [sessionIds],
+        )
+      ).rows;
+      let session =
+        sessions.find((s) => s.id === booking.session_id) ??
+        fail(409, "The booking session is unavailable.");
       const now = new Date();
       let cutoff = new Date(session.cutoff_at);
       const hold = async () => {
+        if (owner?.status !== "approved")
+          fail(409, "This provider is not currently accepting bookings.");
         if (cutoff <= now) fail(409, "Booking cutoff has passed.");
         if (session.allocated + booking.quantity > session.capacity)
           fail(409, "Not enough places remain.");
@@ -243,13 +290,13 @@ export class Platform {
       };
       if (b.action === "accept") {
         if (!provider && !admin) fail(403, "Provider access required.");
-        if (state !== "REQUESTED" || new Date(booking.response_due_at) < now)
+        if (state !== "REQUESTED" || new Date(booking.response_due_at) <= now)
           fail(409, "Request is no longer actionable.");
         await hold();
         state = "PAYMENT_DUE";
       } else if (b.action === "offer") {
         if (!provider && !admin) fail(403, "Provider access required.");
-        if (state !== "REQUESTED" || new Date(booking.response_due_at) < now)
+        if (state !== "REQUESTED" || new Date(booking.response_due_at) <= now)
           fail(409, "Request is no longer actionable.");
         if (!b.amountFils) fail(422, "Enter an offer total.");
         const target = (
@@ -274,16 +321,14 @@ export class Platform {
         if (state !== "OFFER_PENDING" || !offer) fail(409, "No current offer.");
         amount = offer.amountFils;
         if (offer.sessionId && offer.sessionId !== session.id) {
-          const target = (
-            await c.query(
-              "SELECT * FROM app.sessions WHERE id=$1 AND activity_id=$2 FOR UPDATE",
-              [offer.sessionId, session.activity_id],
-            )
-          ).rows[0];
+          const target = sessions.find(
+            (s) =>
+              s.id === offer.sessionId && s.activity_id === session.activity_id,
+          );
           if (!target) fail(409, "Offered session is unavailable.");
           const ages = (
             await c.query(
-              "SELECT x.birth_date,a.min_age,a.max_age FROM app.participants j JOIN app.children x ON x.id=j.child_id JOIN app.activities a ON a.id=$2 WHERE j.booking_id=$1",
+              "SELECT x.birth_date::text AS birth_date,a.min_age,a.max_age FROM app.participants j JOIN app.children x ON x.id=j.child_id JOIN app.activities a ON a.id=$2 WHERE j.booking_id=$1",
               [id, session.activity_id],
             )
           ).rows;
@@ -325,7 +370,7 @@ export class Platform {
             409,
             "Payment collection and verification ownership must be configured first.",
           );
-        if (state !== "PAYMENT_DUE" || new Date(due) < now)
+        if (state !== "PAYMENT_DUE" || !due || new Date(due) <= now)
           fail(409, "Payment window is closed.");
         if (!b.reference) fail(422, "Payment reference is required.");
         await c.query(
@@ -438,6 +483,15 @@ export class Platform {
   async createActivity(a: Actor, b: Record<string, any>) {
     this.admin(a);
     return transaction(this.db, async (c) => {
+      const provider = (
+        await c.query(
+          "SELECT id,status FROM app.providers WHERE id=$1 FOR SHARE",
+          [b.providerId],
+        )
+      ).rows[0];
+      if (!provider) fail(404, "Provider not found.");
+      if (b.published && provider.status !== "approved")
+        fail(409, "Only approved providers can publish activities.");
       const id = uid(),
         sessionId = uid();
       await c.query(
@@ -567,6 +621,8 @@ export class Platform {
     });
   }
   async correction(a: Actor, activityId: string, message: string) {
+    if (!["provider", "admin"].includes(a.role))
+      fail(403, "Provider access required.");
     return transaction(this.db, async (c) => {
       const activity = (
         await c.query(
@@ -634,7 +690,7 @@ export class Platform {
   }
   managementCatalog(a: Actor) {
     return this.read(
-      `SELECT a.*,p.name AS provider_name,COALESCE((SELECT json_agg(s ORDER BY starts_at) FROM app.sessions s WHERE s.activity_id=a.id),'[]') AS sessions FROM app.activities a JOIN app.providers p ON p.id=a.provider_id WHERE $2='admin' OR p.owner_id=$1 ORDER BY a.title`,
+      `SELECT a.*,p.name AS provider_name,COALESCE((SELECT json_agg(s ORDER BY starts_at) FROM app.sessions s WHERE s.activity_id=a.id),'[]') AS sessions FROM app.activities a JOIN app.providers p ON p.id=a.provider_id WHERE $2='admin' OR ($2='provider' AND p.owner_id=$1) ORDER BY a.title`,
       [a.id, a.role],
     );
   }
@@ -649,6 +705,16 @@ export class Platform {
       if (!old) fail(404, "Activity not found.");
       if (old.version !== b.version)
         fail(409, "This listing changed. Refresh and try again.");
+      if (b.published) {
+        const provider = (
+          await c.query(
+            "SELECT status FROM app.providers WHERE id=$1 FOR SHARE",
+            [old.provider_id],
+          )
+        ).rows[0];
+        if (provider?.status !== "approved")
+          fail(409, "Only approved providers can publish activities.");
+      }
       await c.query(
         "UPDATE app.activities SET title=$2,description=$3,category=$4,area=$5,min_age=$6,max_age=$7,price_fils=$8,policy=$9,published=$10,version=version+1 WHERE id=$1",
         [
@@ -692,7 +758,7 @@ export class Platform {
   }
   corrections(a: Actor) {
     return this.read(
-      `SELECT c.*,a.title,p.name AS provider_name FROM app.corrections c JOIN app.activities a ON a.id=c.activity_id JOIN app.providers p ON p.id=c.provider_id WHERE $2='admin' OR p.owner_id=$1 ORDER BY c.status,c.id`,
+      `SELECT c.*,a.title,p.name AS provider_name FROM app.corrections c JOIN app.activities a ON a.id=c.activity_id JOIN app.providers p ON p.id=c.provider_id WHERE $2='admin' OR ($2='provider' AND p.owner_id=$1) ORDER BY c.status,c.id`,
       [a.id, a.role],
     );
   }
@@ -790,7 +856,7 @@ export class Platform {
   async history(a: Actor, id: string) {
     const visible = (
       await this.read(
-        `SELECT b.id FROM app.bookings b WHERE b.id=$1 AND (b.parent_id=$2 OR $3='admin' OR EXISTS(SELECT 1 FROM app.providers p WHERE p.id=b.provider_id AND p.owner_id=$2))`,
+        `SELECT b.id FROM app.bookings b WHERE b.id=$1 AND (b.parent_id=$2 OR $3='admin' OR ($3='provider' AND EXISTS(SELECT 1 FROM app.providers p WHERE p.id=b.provider_id AND p.owner_id=$2)))`,
         [id, a.id, a.role],
       )
     )[0];
@@ -804,9 +870,14 @@ export class Platform {
     return transaction(this.db, async (c) => {
       const rows = (
         await c.query(
-          "SELECT * FROM app.bookings WHERE state='PAYMENT_DUE' AND payment_due_at<now() ORDER BY id FOR UPDATE SKIP LOCKED",
+          "SELECT * FROM app.bookings WHERE state='PAYMENT_DUE' AND payment_due_at<=now() ORDER BY id LIMIT 100 FOR UPDATE SKIP LOCKED",
         )
       ).rows;
+      if (rows.length)
+        await c.query(
+          "SELECT id FROM app.sessions WHERE id=ANY($1::uuid[]) ORDER BY id FOR UPDATE",
+          [[...new Set(rows.map((b) => b.session_id))].sort()],
+        );
       for (const b of rows) {
         await c.query(
           "UPDATE app.sessions SET allocated=allocated-$2 WHERE id=$1",

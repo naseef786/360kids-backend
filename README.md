@@ -70,3 +70,7 @@ Authenticated routes include `POST /v1/me`, child `/:id/update` and `/:id/archiv
 Child edits/archives require ownership and no active participation. Booking names come from accepted snapshots. Alternative-session offers must reference the same activity; acceptance rechecks ages, cutoff and capacity and atomically moves participants. Partial-child offers and policy-based confirmed rescheduling remain separate decisions.
 
 Do not modify SQL files after deployment; append the next migration instead. Supabase Auth redirect allowlists must include the frontend `/reset-password` URL for password recovery. Reset messages depend on the configured Supabase email service.
+
+## Audit hardening — 10 November 2026
+
+Read `docs/AUDIT_2026-11-10.md` for fixed issues, validation and remaining release gates. Use the matching backend/web version and apply **all four migrations** in the intended development/staging project. The API exposes `/health/ready` separately from liveness and reports its finance capability. Booking queries can request `scope=family` or `scope=provider`; server ownership checks remain authoritative. Run `npm test` and `npm audit --audit-level=moderate` along with the existing checks. No client database changes, deployment or external messages are implied by source validation.

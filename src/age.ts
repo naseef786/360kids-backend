@@ -1,4 +1,15 @@
-/** Age on the activity's Dubai calendar date, including sessions near UTC midnight. */
+/** Calendar date in Dubai, independent of the API server's timezone. */
+export function dubaiCalendarDate(value: string | Date): string {
+  const parts = new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Dubai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(new Date(value));
+  const part = (name: string) => parts.find((p) => p.type === name)!.value;
+  return `${part("year")}-${part("month")}-${part("day")}`;
+}
+/** Eligibility on the Dubai session date. Read PostgreSQL birth dates as calendar strings. */
 export function ageAtSession(
   birthDate: string | Date,
   startsAt: string | Date,

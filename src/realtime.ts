@@ -49,6 +49,9 @@ export function attachRealtime(
   const notifications = platform ? new NotificationService(platform.db) : null;
   const room = (id: string) => "user:" + id;
   const signatures = new Map<string, string>();
+  // Include authenticated handshakes that have not joined their room yet.
+  // Counting room members alone lets simultaneous handshakes exceed the cap.
+  const connections = new Map<string, number>();
   io.use(async (socket, next) => {
     try {
       const token = socket.handshake.auth?.token;
@@ -60,9 +63,23 @@ export function attachRealtime(
       )
         throw new Error("Unavailable");
       const user = await auth(token);
+      if (!(await platform.ready())) throw new Error("Database is not ready");
       const profile = await platform.me(user.id, user.email);
-      if ((io.sockets.adapter.rooms.get(room(profile.id))?.size ?? 0) >= 10)
-        throw new Error("Connection limit");
+      if (socket.conn.readyState !== "open")
+        throw new Error("Connection closed");
+      const count = connections.get(profile.id) ?? 0;
+      if (count >= 10) throw new Error("Connection limit");
+      connections.set(profile.id, count + 1);
+      let released = false;
+      const release = () => {
+        if (released) return;
+        released = true;
+        const remaining = (connections.get(profile.id) ?? 1) - 1;
+        if (remaining) connections.set(profile.id, remaining);
+        else connections.delete(profile.id);
+      };
+      socket.conn.once("close", release);
+      socket.once("disconnect", release);
       socket.data.userId = profile.id;
       socket.data.token = token;
       next();
@@ -122,18 +139,28 @@ export function attachRealtime(
     if (closed || reauthenticating || !platform) return;
     reauthenticating = true;
     try {
-      await Promise.all(
-        [...io.sockets.sockets.values()].map(async (socket: Socket) => {
-          try {
-            const user = await auth(socket.data.token);
-            if (user.id !== socket.data.userId)
-              throw new Error("Identity changed");
-            await platform.me(user.id, user.email);
-          } catch {
-            socket.disconnect(true);
-          }
-        }),
-      );
+      const groups = new Map<string, Socket[]>();
+      for (const socket of io.sockets.sockets.values()) {
+        const key = socket.data.token as string;
+        const group = groups.get(key) ?? [];
+        group.push(socket);
+        groups.set(key, group);
+      }
+      const batches = [...groups.values()];
+      for (let offset = 0; offset < batches.length && !closed; offset += 16)
+        await Promise.all(
+          batches.slice(offset, offset + 16).map(async (sockets) => {
+            const socket = sockets[0];
+            try {
+              const user = await auth(socket.data.token);
+              if (user.id !== socket.data.userId)
+                throw new Error("Identity changed");
+              await platform.me(user.id, user.email);
+            } catch {
+              for (const connection of sockets) connection.disconnect(true);
+            }
+          }),
+        );
     } finally {
       reauthenticating = false;
     }
@@ -152,6 +179,7 @@ export function attachRealtime(
     await new Promise<void>((resolve) => io.close(() => resolve()));
     attempts.clear();
     signatures.clear();
+    connections.clear();
   }
-  return { io, close, sweep };
+  return { io, close, sweep, revalidate };
 }

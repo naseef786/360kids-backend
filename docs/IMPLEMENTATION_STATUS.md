@@ -48,3 +48,7 @@ This increment excludes payment and WhatsApp integration work. Public text and p
 ## Realtime update — 8 November 2026
 
 Partners now have saved dashboard notifications for owned requests and workspace updates, with automatic booking/workspace refresh through Socket.IO. Family and admin notifications are scoped separately. Local verification includes eight passing backend tests (with real Socket.IO connections and tenant-isolation/reconnect checks), backend TypeScript/build, and web lint/TypeScript/build. The normal browser polling/upgrade transport and WebSocket-only clients are tested. Apply migration 003 and configure the matching persistent backend before using this in staging. Hosted service, proxy, load, browser and device verification remain outstanding; source implementation does not mean the client environment is deployed.
+
+## Audit update — 10 November 2026
+
+See `AUDIT_2026-11-10.md` for findings, fixes and release limits. Migration 004 adds private-role protections and scoped-query indexes. The API now checks required migration checksums and Auth configuration for readiness. Booking, session, privacy, reconnect, retry and navigation defects were corrected; dependency advisories were patched. Backend verification now covers 13 tests, and web verification covers 10 tests plus lint/type/build. Hosted Supabase, interactive browser/device QA, deployment operations and the remaining approved scope still prevent a production-ready claim.

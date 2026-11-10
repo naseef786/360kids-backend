@@ -1,7 +1,9 @@
-# Database changes
+# Database migrations
 
-Supabase PostgreSQL is the planned datastore. No schema has been applied.
+Business records live in the private `app` schema. Four ordered, checksummed migrations are maintained here. Run `npm run db:migrate` against the intended development/staging database first; never run migrations automatically from web startup. The runner takes a migration lock, preserves applied checksums and rolls back on failure. An existing application schema without a migration ledger is rejected for operator review; never drop existing records to bypass this check.
 
-Keep reviewed versioned SQL migrations in this repository once domain rules are ready. Do not create production tables from startup code. Preserve booking/payment/refund history and tenant ownership. Keep credentials out of Git and use isolated development/staging/production projects.
+Migration 004 revokes PUBLIC/anon/authenticated access to application tables and sequences and adds indexes. The server database role must retain the intended application privileges. Keep the schema out of Supabase browser Data API access and keep privileged credentials server-side.
 
-Do not import real contacts or children into this public repository. Contact import data belongs in restricted application storage, not migration fixtures.
+The production package must include `database/migrations` beside `dist`. `/health/ready` compares database migration checksums with these SQL files and checks Auth configuration. It does not establish external service or end-to-end readiness. Hosted migration status and restoration still need staging verification.
+
+Never commit real contacts, children, receipts or database credentials. Use isolated development/staging/production projects and synthetic test data.
