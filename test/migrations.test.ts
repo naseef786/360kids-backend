@@ -28,8 +28,11 @@ test("versioned migrations backfill legacy owners, rerun safely and detect edits
     const db = databaseFor(pg);
     assert.deepEqual(await migrate(db), [
       "001_platform.sql",
+      "002_base_features.sql",
       "002_provider_memberships.sql",
       "003_minimal_child_profiles.sql",
+      "003_notifications.sql",
+      "004_private_access_indexes.sql",
       "004_saved_activities.sql",
       "005_paginated_list_indexes.sql",
     ]);

@@ -20,9 +20,13 @@ test("API starter reports its limits and handles invalid requests", async () => 
       version: "0.1.0",
       stage: "development",
       bookingsAvailable: false,
+      financeEnabled: false,
       whatsappSendingAvailable: false,
       financeWorkflowEnabled: false,
     });
+    const readiness = await fetch(`${origin}/health/ready`);
+    assert.equal(readiness.status, 503);
+    assert.equal((await readiness.json()).status, "not_ready");
     const missing = await fetch(`${origin}/v1/bookings`);
     assert.equal(missing.status, 503);
     const bad = await fetch(`${origin}/v1/status`, {

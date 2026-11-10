@@ -35,6 +35,7 @@ export function createApp(
       version: "0.1.0",
       stage: "development",
       bookingsAvailable: Boolean(platform || process.env.DATABASE_URL),
+      financeEnabled: Boolean(platform?.financeEnabled),
       whatsappSendingAvailable: false,
       financeWorkflowEnabled: process.env.FINANCE_WORKFLOW_ENABLED === "true",
     }),

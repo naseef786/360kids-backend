@@ -27,6 +27,14 @@ export class Platform {
     readonly db: Database,
     readonly financeEnabled = false,
   ) {}
+  async ready() {
+    try {
+      await this.read("SELECT 1");
+      return true;
+    } catch {
+      return false;
+    }
+  }
   async read(sql: string, params: unknown[] = []) {
     const c = await this.db.connect();
     try {

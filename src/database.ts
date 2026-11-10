@@ -10,6 +10,7 @@ export interface Connection {
 }
 export interface Database {
   connect(): Promise<Connection>;
+  end?(): Promise<void>;
 }
 export function connectionOptions(
   env: NodeJS.ProcessEnv = process.env,
