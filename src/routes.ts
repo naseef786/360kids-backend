@@ -10,6 +10,7 @@ const date = z
   .regex(/^\d{4}-\d{2}-\d{2}$/)
   .refine(
     (s) =>
+      Number(s.slice(0, 4)) >= 1 &&
       !Number.isNaN(Date.parse(s)) &&
       new Date(s).toISOString().slice(0, 10) === s &&
       s <= dubaiCalendarDate(new Date()),
@@ -95,6 +96,7 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
     const b = z
       .object({
         sessionId: uuid,
+        activityVersion: z.number().int().positive(),
         childIds: z
           .array(uuid)
           .min(1)

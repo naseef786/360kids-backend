@@ -52,6 +52,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
       () =>
         p.request(other, "wrong-owner", {
           sessionId: activity.sessionId,
+        activityVersion: 1,
           childIds: [kid.id],
           policyAccepted: true,
         }),
@@ -59,6 +60,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
     );
     const body = {
       sessionId: activity.sessionId,
+        activityVersion: 1,
       childIds: [kid.id],
       policyAccepted: true,
     };
@@ -90,6 +92,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
     );
     const second = await p.request(other, "second-request", {
       sessionId: activity.sessionId,
+        activityVersion: 1,
       childIds: [kid2.id],
       policyAccepted: true,
     });
@@ -281,6 +284,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
     });
     const changed = await p.request(parent, "new-date-request", {
       sessionId: activity.sessionId,
+        activityVersion: 3,
       childIds: [kid.id],
       policyAccepted: true,
     });

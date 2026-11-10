@@ -180,6 +180,7 @@ test("suspended providers cannot publish or acquire places; operational notifica
     assert.equal((await p.children(parent))[0].birth_date, "2018-01-01");
     const booking = await p.request(parent, "audit-request", {
       sessionId: activity.sessionId,
+        activityVersion: 1,
       childIds: [child.id],
       policyAccepted: true,
     });

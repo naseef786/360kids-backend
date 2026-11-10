@@ -74,3 +74,7 @@ Do not modify SQL files after deployment; append the next migration instead. Sup
 ## Audit hardening — 10 November 2026
 
 Read `docs/AUDIT_2026-11-10.md` for fixed issues, validation and remaining release gates. Use the matching backend/web version and apply **all four migrations** in the intended development/staging project. The API exposes `/health/ready` separately from liveness and reports its finance capability. Booking queries can request `scope=family` or `scope=provider`; server ownership checks remain authoritative. Run `npm test` and `npm audit --audit-level=moderate` along with the existing checks. No client database changes, deployment or external messages are implied by source validation.
+
+## Listing review contract
+
+`POST /v1/bookings` requires `activityVersion` from the reviewed catalog listing. A changed listing returns 409 so the parent must refresh and review the current price and terms. Deploy the matching frontend and backend together.

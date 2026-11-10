@@ -63,8 +63,8 @@ export function attachRealtime(
       )
         throw new Error("Unavailable");
       const user = await auth(token);
-      if (!(await platform.ready())) throw new Error("Database is not ready");
       const profile = await platform.me(user.id, user.email);
+      if (!(await platform.ready())) throw new Error("Database is not ready");
       if (socket.conn.readyState !== "open")
         throw new Error("Connection closed");
       const count = connections.get(profile.id) ?? 0;

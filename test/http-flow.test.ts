@@ -73,10 +73,30 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
   try {
     const body = {
         sessionId: activity.sessionId,
+        activityVersion: 1,
         childIds: [child.id],
         policyAccepted: true,
       },
       key = randomUUID();
+    const listing = (await p.managementCatalog(actors.admin))[0];
+    await p.editActivity(actors.admin, activity.id, {
+      version: listing.version,
+      title: listing.title,
+      description: listing.description,
+      category: listing.category,
+      area: listing.area,
+      minAge: listing.min_age,
+      maxAge: listing.max_age,
+      priceFils: 12000,
+      policy: "Updated synthetic terms.",
+      published: true,
+    });
+    const stale = await call("/bookings", "parent", body, key);
+    assert.equal(stale.status, 409);
+    assert.match((await stale.json()).message, /price or terms changed/);
+    assert.equal((await p.bookings(actors.parent)).length, 0);
+    body.activityVersion = (await p.catalog())[0].version;
+    assert.equal(body.activityVersion, 2);
     const first = await call("/bookings", "parent", body, key);
     assert.equal(first.status, 201);
     const booking = await first.json();
@@ -104,6 +124,8 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
     assert.equal(accepted.status, 200);
     assert.equal((await accepted.json()).state, "PAYMENT_DUE");
     const parentBookings = await (await call("/bookings", "parent")).json();
+    assert.equal(parentBookings[0].amount_fils, 12000);
+    assert.equal(parentBookings[0].snapshot.listingVersion, 2);
     assert.equal(parentBookings[0].held, true);
     assert.equal(parentBookings[0].state, "PAYMENT_DUE");
     assert.equal(JSON.stringify(parentBookings).includes("birth_date"), false);
@@ -160,6 +182,7 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
       "synthetic-own-family",
       {
         sessionId: activity.sessionId,
+        activityVersion: 2,
         childIds: [ownChild.id],
         policyAccepted: true,
       },

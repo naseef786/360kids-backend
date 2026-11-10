@@ -148,18 +148,20 @@ export class Platform {
   async request(
     a: Actor,
     key: string,
-    b: { sessionId: string; childIds: string[]; policyAccepted: boolean },
+    b: { sessionId: string; activityVersion: number; childIds: string[]; policyAccepted: boolean },
   ) {
     if (!b.policyAccepted) fail(422, "Accept the cancellation policy.");
     return this.command(a, key, { op: "request", ...b }, async (c) => {
       const s = (
         await c.query(
-          `SELECT s.*,a.title,a.price_fils,a.policy,a.provider_id,a.min_age,a.max_age,p.name AS provider_name FROM app.sessions s JOIN app.activities a ON a.id=s.activity_id JOIN app.providers p ON p.id=a.provider_id WHERE s.id=$1 AND a.published AND p.status='approved'`,
+          `SELECT s.*,a.title,a.version AS activity_version,a.price_fils,a.policy,a.provider_id,a.min_age,a.max_age,p.name AS provider_name FROM app.sessions s JOIN app.activities a ON a.id=s.activity_id JOIN app.providers p ON p.id=a.provider_id WHERE s.id=$1 AND a.published AND p.status='approved'`,
           [b.sessionId],
         )
       ).rows[0];
       if (!s || new Date(s.cutoff_at) <= new Date())
         fail(409, "This session is no longer accepting requests.");
+      if (b.activityVersion !== s.activity_version)
+        fail(409, "This listing’s price or terms changed. Refresh the page and review the latest details before requesting.");
       const kids = (
         await c.query(
           "SELECT id,first_name,surname,birth_date::text AS birth_date FROM app.children WHERE parent_id=$1 AND NOT archived AND id=ANY($2::uuid[]) ORDER BY id FOR SHARE",
@@ -178,6 +180,7 @@ export class Platform {
           Math.min(Date.now() + 86400000, new Date(s.cutoff_at).getTime()),
         );
       const snapshot = {
+        listingVersion: s.activity_version,
         title: s.title,
         provider: s.provider_name,
         startsAt: s.starts_at,

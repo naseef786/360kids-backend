@@ -141,6 +141,7 @@ test(
       );
       const request = await p.request(parent, "socket-request", {
         sessionId: activity.sessionId,
+        activityVersion: 1,
         childIds: [child.id],
         policyAccepted: true,
       });
