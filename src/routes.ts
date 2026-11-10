@@ -1,3 +1,4 @@
+import { bookingPageQuery } from "./booking-pages.js";
 import { NotificationService } from "./notifications.js";
 import { Router, type RequestHandler } from "express";
 import { z } from "zod";
@@ -84,6 +85,9 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
       .object({ firstName: text, surname: text, birthDate: date })
       .parse(q.body);
     s.status(201).json(await p.addChild(actor(s), b));
+  });
+  r.get("/bookings/page", async (q, s) => {
+    s.json(await p.bookingPage(actor(s), bookingPageQuery.parse(q.query)));
   });
   r.get("/bookings", async (q, s) => {
     const scope = z

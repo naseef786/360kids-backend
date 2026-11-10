@@ -52,3 +52,7 @@ Partners now have saved dashboard notifications for owned requests and workspace
 ## Audit update — 10 November 2026
 
 See `AUDIT_2026-11-10.md` for findings, fixes and release limits. Migration 004 adds private-role protections and scoped-query indexes. The API now checks required migration checksums and Auth configuration for readiness. Booking, session, privacy, reconnect, retry and navigation defects were corrected; dependency advisories were patched. Backend verification now covers 13 tests, and web verification covers 10 tests plus lint/type/build. Hosted Supabase, interactive browser/device QA, deployment operations and the remaining approved scope still prevent a production-ready claim.
+
+## Booking-list improvement — 10 November 2026
+
+Server-side booking search/status filters and cursor pagination replace the website's 200-record list cap. Overview counts now cover the complete authorized workspace, and full lists support load-more/retry states. The legacy array endpoint stays bounded for compatibility. See `BOOKING_PAGINATION.md` for the contract, tests and staging QA requirements. This code update does not deploy the project or complete the remaining production gates.

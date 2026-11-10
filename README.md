@@ -78,3 +78,7 @@ Read `docs/AUDIT_2026-11-10.md` for fixed issues, validation and remaining relea
 ## Listing review contract
 
 `POST /v1/bookings` requires `activityVersion` from the reviewed catalog listing. A changed listing returns 409 so the parent must refresh and review the current price and terms. Deploy the matching frontend and backend together.
+
+## Booking search and pagination
+
+The website uses authenticated `GET /v1/bookings/page` for scoped search, status filters, complete workspace counts and cursor pagination. Deploy the updated backend before this frontend; the existing four migrations are sufficient. The legacy booking array API remains available. See `docs/BOOKING_PAGINATION.md`.
