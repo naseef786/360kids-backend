@@ -1,3 +1,8 @@
+import {
+  readBookingCursor,
+  nextBookingCursor,
+  type BookingPageQuery,
+} from "./booking-pages.js";
 import { recordNotifications } from "./notifications.js";
 import { readMigrations } from "./migrations.js";
 import { ageAtSession } from "./age.js";
@@ -114,6 +119,58 @@ export class Platform {
       [a.id, a.role, scope],
     );
   }
+  async bookingPage(a: Actor, query: BookingPageQuery) {
+    const cursor = readBookingCursor(query);
+    // Escape LIKE metacharacters: search text is literal, never a wildcard expression.
+    const search = query.search
+      ? "%" + query.search.replace(/[\\%_]/g, "\\$&") + "%"
+      : "";
+    const [result] = await this.read(
+      `WITH scoped AS MATERIALIZED (
+        SELECT b.* FROM app.bookings b WHERE
+        ($3='family' AND b.parent_id=$1) OR
+        ($3='provider' AND ($2='admin' OR ($2='provider' AND EXISTS(SELECT 1 FROM app.providers p WHERE p.id=b.provider_id AND p.owner_id=$1)))) OR
+        ($3='all' AND ($2='admin' OR b.parent_id=$1 OR ($2='provider' AND EXISTS(SELECT 1 FROM app.providers p WHERE p.id=b.provider_id AND p.owner_id=$1))))
+      ), filtered AS (
+        SELECT b.* FROM scoped b WHERE
+        ($4='all' OR b.state=$4 OR ($4='attention' AND b.state IN ('REQUESTED','OFFER_PENDING','PAYMENT_DUE','PAYMENT_CHECKING')))
+        AND ($5='' OR b.id::text ILIKE $5 OR b.snapshot->>'title' ILIKE $5 OR b.snapshot->>'provider' ILIKE $5)
+      ), page AS (
+        SELECT b.* FROM filtered b WHERE
+        ($6::timestamptz IS NULL OR (b.created_at,b.id)<($6::timestamptz,$7::uuid))
+        ORDER BY b.created_at DESC,b.id DESC LIMIT $8
+      )
+      SELECT
+        (SELECT count(*)::int FROM filtered) AS total,
+        COALESCE((SELECT jsonb_object_agg(c.state,c.count) FROM (SELECT state,count(*)::int AS count FROM scoped GROUP BY state) c),'{}'::jsonb) AS counts,
+        COALESCE((SELECT jsonb_agg(to_jsonb(b) || jsonb_build_object(
+          'children',COALESCE((SELECT jsonb_agg(jsonb_build_object('id',x->>'id','first_name',x->>'firstName','surname',x->>'surname')) FROM jsonb_array_elements(b.snapshot->'children') x),'[]'::jsonb),
+          'payments',(SELECT jsonb_agg(p) FROM app.payments p WHERE p.booking_id=b.id),
+          'refunds',(SELECT jsonb_agg(r) FROM app.refunds r WHERE r.booking_id=b.id)
+        ) ORDER BY b.created_at DESC,b.id DESC) FROM page b),'[]'::jsonb) AS items`,
+      [
+        a.id,
+        a.role,
+        query.scope,
+        query.state,
+        search,
+        cursor?.createdAt ?? null,
+        cursor?.id ?? null,
+        query.limit + 1,
+      ],
+    );
+    const hasMore = result.items.length > query.limit;
+    const items = result.items.slice(0, query.limit);
+    // JSON timestamps retain PostgreSQL microseconds; converting to JS Date would lose them.
+    return {
+      items,
+      total: result.total,
+      counts: result.counts,
+      nextCursor: hasMore
+        ? nextBookingCursor(query, items[items.length - 1])
+        : null,
+    };
+  }
   async command<T>(
     a: Actor,
     key: string,
@@ -148,7 +205,12 @@ export class Platform {
   async request(
     a: Actor,
     key: string,
-    b: { sessionId: string; activityVersion: number; childIds: string[]; policyAccepted: boolean },
+    b: {
+      sessionId: string;
+      activityVersion: number;
+      childIds: string[];
+      policyAccepted: boolean;
+    },
   ) {
     if (!b.policyAccepted) fail(422, "Accept the cancellation policy.");
     return this.command(a, key, { op: "request", ...b }, async (c) => {
@@ -161,7 +223,10 @@ export class Platform {
       if (!s || new Date(s.cutoff_at) <= new Date())
         fail(409, "This session is no longer accepting requests.");
       if (b.activityVersion !== s.activity_version)
-        fail(409, "This listing’s price or terms changed. Refresh the page and review the latest details before requesting.");
+        fail(
+          409,
+          "This listing’s price or terms changed. Refresh the page and review the latest details before requesting.",
+        );
       const kids = (
         await c.query(
           "SELECT id,first_name,surname,birth_date::text AS birth_date FROM app.children WHERE parent_id=$1 AND NOT archived AND id=ANY($2::uuid[]) ORDER BY id FOR SHARE",
