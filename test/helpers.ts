@@ -1,5 +1,5 @@
 import { PGlite } from "@electric-sql/pglite";
-import { applyMigrations } from "../src/migrations.js";
+import { migrate } from "../src/migrations.js";
 import type { Connection, Database } from "../src/database.js";
 
 export async function createTestDatabase() {
@@ -20,7 +20,7 @@ export async function createTestDatabase() {
     };
   };
   const connection: Connection = { query, release() {} };
-  await applyMigrations(connection);
+  await migrate({connect: async () => connection});
   // PGlite has one embedded connection; serialize transactions and standalone
   // reads so a background sweep cannot observe another transaction's writes.
   let tail = Promise.resolve();

@@ -1,3 +1,5 @@
+import { migrate } from "../src/migrations.js";
+import { databaseFor } from "./support/database.js";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
@@ -7,30 +9,6 @@ import type { Database } from "../src/database.js";
 import { randomUUID } from "node:crypto";
 test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppression", async () => {
   const pg = new PGlite();
-  await pg.exec(
-    await readFile(
-      new URL("../database/migrations/001_platform.sql", import.meta.url),
-      "utf8",
-    ),
-  );
-  await pg.exec(
-    await readFile(
-      new URL(
-        "../database/migrations/002_provider_memberships.sql",
-        import.meta.url,
-      ),
-      "utf8",
-    ),
-  );
-  await pg.exec(
-    await readFile(
-      new URL(
-        "../database/migrations/003_minimal_child_profiles.sql",
-        import.meta.url,
-      ),
-      "utf8",
-    ),
-  );
   const db: Database = {
     connect: async () => ({
       query: async (sql, params = []) => {
@@ -43,6 +21,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
       release() {},
     }),
   };
+  await migrate(databaseFor(pg));
   const p = new Platform(db, true);
   const parent: Actor = { id: randomUUID(), role: "parent" },
     other: Actor = { id: randomUUID(), role: "parent" },
@@ -90,6 +69,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
       () =>
         p.request(other, "wrong-owner", {
           sessionId: activity.sessionId,
+          activityVersion: 1,
           childIds: [kid.id],
           policyAccepted: true,
         }),
@@ -97,6 +77,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
     );
     const body = {
       sessionId: activity.sessionId,
+          activityVersion: 1,
       childIds: [kid.id],
       policyAccepted: true,
     };
@@ -128,6 +109,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
     );
     const second = await p.request(other, "second-request", {
       sessionId: activity.sessionId,
+          activityVersion: 1,
       childIds: [kid2.id],
       policyAccepted: true,
     });

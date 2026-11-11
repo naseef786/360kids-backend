@@ -1,5 +1,9 @@
 # Phase 1 implementation status
 
+## Current source review
+
+See [the architecture review](ARCHITECTURE_REVIEW_2026-11-10.md) for verified fixes, current boundaries and remaining release blockers. Earlier connected-verification notes below describe historical checks and are not proof that every claimed workflow exists in the current checkout. Production completeness is still not established.
+
 ## Implemented in this increment
 
 - Backend endpoints for catalog/detail and family/provider/admin operations. The local approved-design web app is now connected to these APIs and real Supabase sessions; existing companion feature PRs still need repository reconciliation before release.

@@ -117,6 +117,7 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
     assert.equal(minimal.surname, "");
     const ownBooking = await p.request(actors.staff, "age-only-request", {
       sessionId: activity.sessionId,
+          activityVersion: 1,
       childIds: [ageOnly.id],
       policyAccepted: true,
     });
@@ -136,6 +137,7 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
       () =>
         p.request(actors.staff, "uncertain-age-request", {
           sessionId: narrow.sessionId,
+          activityVersion: 1,
           childIds: [ageOnly.id],
           policyAccepted: true,
         }),
@@ -156,6 +158,7 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
     assert.equal((await p.children(actors.staff))[0].age_years, null);
     const booking = await p.request(actors.parent, "organization-request", {
       sessionId: activity.sessionId,
+          activityVersion: 1,
       childIds: [child.id],
       policyAccepted: true,
     });
@@ -539,4 +542,41 @@ test("authentication separates invalid credentials, upstream failure and validat
     if (oldKey === undefined) delete process.env.SUPABASE_PUBLISHABLE_KEY;
     else process.env.SUPABASE_PUBLISHABLE_KEY = oldKey;
   }
+});
+
+test("support isolation, pagination and reviewed content publication", async () => {
+  const pg = new PGlite();
+  try {
+    const db = databaseFor(pg);
+    await migrate(db);
+    const p = new Platform(db);
+    const parent = {id:randomUUID(),role:"parent"};
+    const other = {id:randomUUID(),role:"parent"};
+    const admin = {id:randomUUID(),role:"admin"};
+    for(const a of [parent,other,admin]) await p.me(a.id,`${a.id}@example.invalid`);
+    const ticket = await p.createSupport(parent,"Booking","Synthetic support message");
+    await p.createSupport(parent,"Account","Another synthetic message");
+    await p.createSupport(other,"Account","Private other account message");
+    const first = await p.support(parent,{page:1,pageSize:1});
+    const second = await p.support(parent,{page:2,pageSize:1});
+    assert.equal(first.total,2);
+    assert.equal(first.pages,2);
+    assert.notEqual(first.items[0].id,second.items[0].id);
+    assert.equal((await p.support(admin,{page:1,pageSize:20})).total,3);
+    await assert.rejects(()=>p.replySupport(other,ticket.id,"resolved","Denied"),/Administrator/);
+    await p.replySupport(admin,ticket.id,"resolved","Synthetic response");
+    assert.equal((await p.support(parent,{page:1,pageSize:20},"resolved")).total,1);
+    assert.equal((await p.support(other,{page:1,pageSize:20},"resolved")).total,0);
+    const draft={title:"About",body:"Reviewed synthetic content",published:false,version:0};
+    await assert.rejects(()=>p.saveContent(parent,"about",draft),/Administrator/);
+    await p.saveContent(admin,"about",draft);
+    assert.equal(await p.content("about"),null);
+    assert.equal((await p.content("about",admin)).version,1);
+    await assert.rejects(()=>p.saveContent(admin,"about",draft),/changed/);
+    await p.saveContent(admin,"about",{...draft,published:true,version:1});
+    assert.equal((await p.content("about")).version,2);
+    await assert.rejects(()=>p.saveContent(admin,"about",{...draft,version:1}),/changed/);
+    await p.saveContent(admin,"about",{...draft,version:2});
+    assert.equal(await p.content("about"),null);
+  } finally { await pg.close(); }
 });

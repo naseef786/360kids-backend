@@ -2,6 +2,8 @@ import { randomUUID, createHash } from "node:crypto";
 import { transaction, type Database, type Connection } from "./database.js";
 import { ageOnDate, possibleAges, dubaiDate } from "./eligibility.js";
 import type { Pagination } from "./pagination.js";
+import { recordNotifications } from "./notifications.js";
+import { migrationsReady } from "./migrations.js";
 export interface Actor {
   id: string;
   role: string;
@@ -29,11 +31,45 @@ export class Platform {
   ) {}
   async ready() {
     try {
-      await this.read("SELECT 1");
-      return true;
+      return await migrationsReady(this.db);
     } catch {
       return false;
     }
+  }
+  async support(a: Actor, paging: Pagination, status?: string) {
+    return this.page("SELECT * FROM app.support WHERE ($1='admin' OR owner_id=$2) AND ($3::text IS NULL OR status=$3) ORDER BY created_at DESC,id", [a.role,a.id,status ?? null], paging);
+  }
+  async createSupport(a: Actor, topic: string, message: string) {
+    return transaction(this.db, async c => {
+      const id = uid();
+      await c.query("INSERT INTO app.support(id,owner_id,topic,message) VALUES($1,$2,$3,$4)", [id,a.id,topic,message]);
+      await this.audit(c,a,id,"support.created");
+      return { id };
+    });
+  }
+  async replySupport(a: Actor, id: string, status: string, reply: string) {
+    if(a.role !== "admin") fail(403,"Administrator access required.");
+    return transaction(this.db, async c => {
+      const result = await c.query("UPDATE app.support SET status=$2,reply=$3,updated_at=now() WHERE id=$1 RETURNING id", [id,status,reply]);
+      if(!result.rows.length) fail(404,"Support request not found.");
+      await this.audit(c,a,id,"support.updated");
+      return { id };
+    });
+  }
+  async content(slug: string, a?: Actor) {
+    const rows = await this.read("SELECT * FROM app.content WHERE slug=$1 AND ($2 OR published)", [slug,a?.role === "admin"]);
+    return rows[0] ?? null;
+  }
+  async saveContent(a: Actor, slug: string, body: {title:string;body:string;published:boolean;version:number}) {
+    if(a.role !== "admin") fail(403,"Administrator access required.");
+    return transaction(this.db, async c => {
+      const result = await c.query(`INSERT INTO app.content(slug,title,body,published) SELECT $1,$2,$3,$4 WHERE $5=0
+        ON CONFLICT(slug) DO NOTHING RETURNING *`, [slug,body.title,body.body,body.published,body.version]);
+      const rows = body.version === 0 ? result.rows : (await c.query("UPDATE app.content SET title=$2,body=$3,published=$4,version=version+1,updated_at=now() WHERE slug=$1 AND version=$5 RETURNING *", [slug,body.title,body.body,body.published,body.version])).rows;
+      if(!rows.length) fail(409,"This page changed. Reload before editing again.");
+      await this.audit(c,a,a.id,"content.updated",{slug});
+      return rows[0];
+    });
   }
   async read(sql: string, params: unknown[] = []) {
     const c = await this.db.connect();
@@ -50,10 +86,12 @@ export class Platform {
     action: string,
     details: unknown = {},
   ) {
+    const auditId = uid();
     await c.query(
       "INSERT INTO app.audit(id,actor_id,subject_id,action,details) VALUES($1,$2,$3,$4,$5)",
-      [uid(), a.id, subject, action, JSON.stringify(details)],
+      [auditId, a.id, subject, action, JSON.stringify(details)],
     );
+    await recordNotifications(c, auditId, subject, action);
   }
   async page(sql: string, params: unknown[], paging: Pagination) {
     const n = params.length;
@@ -96,7 +134,7 @@ export class Platform {
     }
     if (resource === "activities")
       return this.page(
-        `SELECT a.*,p.name AS provider_name FROM app.activities a JOIN app.providers p ON p.id=a.provider_id
+        `SELECT a.*,p.name AS provider_name,EXISTS(SELECT 1 FROM app.saved_activities saved WHERE saved.activity_id=a.id AND saved.user_id=$5::uuid) AS is_saved FROM app.activities a JOIN app.providers p ON p.id=a.provider_id
       WHERE a.published AND p.status='approved'
       AND ($1::text IS NULL OR strpos(lower(a.title||' '||a.description||' '||a.category||' '||a.area),lower($1))>0)
       AND ($2::text IS NULL OR lower(a.category)=lower($2)) AND ($3::text IS NULL OR lower(a.area)=lower($3))
@@ -106,6 +144,7 @@ export class Platform {
           filters.category ?? null,
           filters.area ?? null,
           filters.age ?? null,
+          a.role === "public" ? null : a.id,
         ],
         paging,
       );
@@ -181,7 +220,7 @@ export class Platform {
   async me(id: string, email: string) {
     return transaction(this.db, async (c) => {
       await c.query(
-        "INSERT INTO app.profiles(id,email) VALUES($1,$2) ON CONFLICT(id) DO NOTHING",
+        "INSERT INTO app.profiles(id,email) VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET email=EXCLUDED.email",
         [id, email],
       );
       const p = (
@@ -201,7 +240,7 @@ export class Platform {
       const roles = ["parent"];
       if (hasPartner) roles.push("partner");
       if (p.role === "admin") roles.push("superadmin");
-      return { ...p, roles };
+      return { ...p, id: p.id as string, role: p.role as string, email: p.email as string, roles };
     });
   }
   catalog(filters: CatalogFilters = {}) {
@@ -224,12 +263,12 @@ export class Platform {
       ],
     );
   }
-  async activity(id: string) {
+  async activity(id: string, actor?: Actor) {
     const result = await this.read(
-      `SELECT a.*,p.name AS provider_name
+      `SELECT a.*,p.name AS provider_name,EXISTS(SELECT 1 FROM app.saved_activities saved WHERE saved.activity_id=a.id AND saved.user_id=$2::uuid) AS is_saved
        FROM app.activities a JOIN app.providers p ON p.id=a.provider_id
        WHERE a.id=$1 AND a.published AND p.status='approved'`,
-      [id],
+      [id,actor?.role === "public" ? null : actor?.id ?? null],
     );
     if (!result.length) fail(404, "Activity not found.");
     return result[0];
@@ -279,7 +318,7 @@ export class Platform {
     return transaction(this.db, async (c) => {
       const result = (
         await c.query(
-          `UPDATE app.activities SET published=$2 WHERE id=$1
+          `UPDATE app.activities SET published=$2,version=version+1 WHERE id=$1
         AND (NOT $2 OR EXISTS(SELECT 1 FROM app.providers p WHERE p.id=provider_id AND p.status='approved')) RETURNING id,published`,
           [id, published],
         )
@@ -300,7 +339,7 @@ export class Platform {
     return transaction(this.db, async (c) => {
       const result = (
         await c.query(
-          `UPDATE app.activities SET title=$2,description=$3,category=$4,area=$5,min_age=$6,max_age=$7,price_fils=$8,policy=$9 WHERE id=$1 RETURNING id`,
+          `UPDATE app.activities SET title=$2,description=$3,category=$4,area=$5,min_age=$6,max_age=$7,price_fils=$8,policy=$9,version=version+1 WHERE id=$1 RETURNING id,version`,
           [
             id,
             b.title,
@@ -470,21 +509,23 @@ export class Platform {
   async request(
     a: Actor,
     key: string,
-    b: { sessionId: string; childIds: string[]; policyAccepted: boolean },
+    b: { sessionId: string; activityVersion: number; childIds: string[]; policyAccepted: boolean },
   ) {
     if (!b.policyAccepted) fail(422, "Accept the cancellation policy.");
     return this.command(a, key, { op: "request", ...b }, async (c) => {
       const s = (
         await c.query(
-          `SELECT s.*,a.title,a.price_fils,a.policy,a.provider_id,a.min_age,a.max_age,p.name AS provider_name FROM app.sessions s JOIN app.activities a ON a.id=s.activity_id JOIN app.providers p ON p.id=a.provider_id WHERE s.id=$1 AND a.published AND p.status='approved'`,
+          `SELECT s.*,a.version AS listing_version,a.title,a.price_fils,a.policy,a.provider_id,a.min_age,a.max_age,p.name AS provider_name FROM app.sessions s JOIN app.activities a ON a.id=s.activity_id JOIN app.providers p ON p.id=a.provider_id WHERE s.id=$1 AND a.published AND p.status='approved' FOR SHARE OF a,p`,
           [b.sessionId],
         )
       ).rows[0];
       if (!s || new Date(s.cutoff_at) <= new Date())
         fail(409, "This session is no longer accepting requests.");
+      if (b.activityVersion !== s.listing_version)
+        fail(409, "The activity price or terms changed. Review the current listing.");
       const kids = (
         await c.query(
-          "SELECT * FROM app.children WHERE parent_id=$1 AND id=ANY($2::uuid[])",
+          "SELECT * FROM app.children WHERE parent_id=$1 AND NOT archived AND id=ANY($2::uuid[])",
           [a.id, b.childIds],
         )
       ).rows;
@@ -516,6 +557,7 @@ export class Platform {
           Math.min(Date.now() + 86400000, new Date(s.cutoff_at).getTime()),
         );
       const snapshot = {
+        listingVersion: s.listing_version,
         title: s.title,
         provider: s.provider_name,
         startsAt: s.starts_at,
@@ -605,6 +647,7 @@ export class Platform {
         const now = new Date();
         const cutoff = new Date(session.cutoff_at);
         const hold = async () => {
+          if (owner.status !== 'approved') fail(409,"Provider is not currently accepting bookings.");
           if (cutoff <= now) fail(409, "Booking cutoff has passed.");
           if (session.allocated + booking.quantity > session.capacity)
             fail(409, "Not enough places remain.");
@@ -871,6 +914,10 @@ export class Platform {
   }
   async createActivity(a: Actor, b: Record<string, any>) {
     return transaction(this.db, async (c) => {
+      if (b.published) {
+        const provider = (await c.query("SELECT status FROM app.providers WHERE id=$1 FOR SHARE", [b.providerId])).rows[0];
+        if (provider?.status !== 'approved') fail(409,"Only approved providers may have published activities.");
+      }
       if (a.role !== "admin") {
         const member = (
           await c.query(
@@ -1018,17 +1065,20 @@ export class Platform {
       return { id };
     });
   }
-  async expire() {
+  async expire(batchSize = 100) {
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 100)
+      fail(422, "Expiry batch size must be between 1 and 100.");
     return transaction(this.db, async (c) => {
       const rows = (
         await c.query(
-          "SELECT * FROM app.bookings WHERE state='PAYMENT_DUE' AND payment_due_at<now() ORDER BY id FOR UPDATE SKIP LOCKED",
+          "SELECT * FROM app.bookings WHERE state='PAYMENT_DUE' AND payment_due_at<now() ORDER BY payment_due_at,id LIMIT $1 FOR UPDATE SKIP LOCKED",
+          [batchSize],
         )
       ).rows;
       for (const b of rows) {
         await c.query(
           "UPDATE app.sessions SET allocated=allocated-$2 WHERE id=$1",
-          [b.session_id, b.quantity],
+          [b.session_id, b.held ? b.quantity : 0],
         );
         await c.query(
           "UPDATE app.bookings SET state='EXPIRED',held=false,version=version+1 WHERE id=$1",
@@ -1042,6 +1092,9 @@ export class Platform {
           "INSERT INTO app.outbox(id,booking_id,event) VALUES($1,$2,$3)",
           [uid(), b.id, "EXPIRED"],
         );
+        const auditId = uid();
+        await c.query("INSERT INTO app.audit(id,subject_id,action) VALUES($1,$2,'booking.expired')", [auditId,b.id]);
+        await recordNotifications(c,auditId,b.id,"booking.expired");
       }
       return rows.length;
     });

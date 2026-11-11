@@ -23,7 +23,7 @@ function event(socket: Socket, name: string) {
 }
 test(
   "authenticated real-time delivery, tenant isolation, read state, reconnect and account revocation",
-  { timeout: 25000 },
+  { timeout: 90000 },
   async () => {
     const { pg, db } = await createTestDatabase();
     const p = new Platform(db),

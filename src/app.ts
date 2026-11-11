@@ -53,9 +53,7 @@ export function createApp(
         database(),
         process.env.FINANCE_WORKFLOW_ENABLED === "true",
       );
-      await service.read(
-        "SELECT m.provider_id,c.age_years FROM app.provider_memberships m LEFT JOIN app.children c ON false LIMIT 1",
-      );
+      if (!(await service.ready())) throw new Error("Schema is not ready");
       res.status(authenticationConfigured ? 200 : 503).json({
         status: authenticationConfigured ? "ready" : "not_ready",
         database: true,

@@ -71,6 +71,9 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   try {
+    const catalogueResponse = await call("/activities","parent");
+    assert.equal(catalogueResponse.status,200);
+    assert.match(catalogueResponse.headers.get("cache-control") ?? "",/private, no-store/);
     const body = {
         sessionId: activity.sessionId,
         activityVersion: 1,
@@ -78,8 +81,8 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
         policyAccepted: true,
       },
       key = randomUUID();
-    const listing = (await p.managementCatalog(actors.admin))[0];
-    await p.editActivity(actors.admin, activity.id, {
+    const listing = (await p.list("managed-activities",actors.admin,{page:1,pageSize:20})).items[0];
+    await p.updateActivity(actors.admin, activity.id, {
       version: listing.version,
       title: listing.title,
       description: listing.description,
@@ -107,9 +110,9 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
     assert.equal(duplicate.status, 409);
     assert.match(
       (await duplicate.json()).message,
-      /already has an active request/,
+      /active record already exists/,
     );
-    assert.deepEqual(await (await call("/bookings", "other")).json(), []);
+    assert.deepEqual((await (await call("/bookings", "other")).json()).items, []);
     const unauthorized = await call(
       "/bookings/" + booking.id + "/actions",
       "other",
@@ -124,10 +127,10 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
     assert.equal(accepted.status, 200);
     assert.equal((await accepted.json()).state, "PAYMENT_DUE");
     const parentBookings = await (await call("/bookings", "parent")).json();
-    assert.equal(parentBookings[0].amount_fils, 12000);
-    assert.equal(parentBookings[0].snapshot.listingVersion, 2);
-    assert.equal(parentBookings[0].held, true);
-    assert.equal(parentBookings[0].state, "PAYMENT_DUE");
+    assert.equal(parentBookings.items[0].amount_fils, 12000);
+    assert.equal(parentBookings.items[0].snapshot.listingVersion, 2);
+    assert.equal(parentBookings.items[0].held, true);
+    assert.equal(parentBookings.items[0].state, "PAYMENT_DUE");
     assert.equal(JSON.stringify(parentBookings).includes("birth_date"), false);
     const proof = await call("/bookings/" + booking.id + "/actions", "parent", {
       action: "proof",
@@ -146,7 +149,7 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
       0,
     );
     assert.equal(
-      (await call("/bookings/" + booking.id + "/history", "other")).status,
+      (await call("/bookings/" + booking.id + "", "other")).status,
       404,
     );
     const cancelled = await call(
@@ -197,17 +200,17 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
       "family",
     );
     const family = await (
-      await call("/bookings?scope=family", "provider")
+      await call("/bookings?scope=parent", "provider")
     ).json();
-    assert.equal(family.length, 1);
-    assert.equal(family[0].parent_id, actors.provider.id);
+    assert.equal(family.items.length, 1);
+    assert.equal(family.items[0].parent_id, actors.provider.id);
     assert.equal(
-      (await (await call("/bookings?scope=provider", "provider")).json())
-        .length,
+      (await (await call("/bookings?scope=partner", "provider")).json())
+        .items.length,
       2,
     );
     assert.equal(
-      (await (await call("/bookings?scope=family", "admin")).json()).length,
+      (await (await call("/bookings?scope=parent", "admin")).json()).items.length,
       0,
     );
   } finally {

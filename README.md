@@ -1,5 +1,7 @@
 # 360 Kids Backend
 
+Current assessment: **development implementation, not production complete**. See [the architecture review](docs/ARCHITECTURE_REVIEW_2026-11-10.md) for corrected faults and remaining release gates. Apply all bundled migrations and deploy matching web/API versions; booking requests require `activityVersion`, and notifications use `page`/`pageSize`.
+
 Express, TypeScript and PostgreSQL business API for the Next.js website and Expo app. Uses Supabase Auth for identity verification. Database records live in a private `app` schema, accessed by the server connection only.
 
 ## Setup (PowerShell)

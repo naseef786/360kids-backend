@@ -78,10 +78,15 @@ export function connectionOptions(
           },
     max: 10,
     connectionTimeoutMillis: 5000,
+    statement_timeout: 15000,
+    idle_in_transaction_session_timeout: 15000,
   };
 }
 export function database(): Database {
-  return new pg.Pool(connectionOptions());
+  const pool = new pg.Pool(connectionOptions());
+  // An idle connection error must not become an unhandled EventEmitter error.
+  pool.on("error", () => console.error("Idle database connection failed; the pool will reconnect."));
+  return pool;
 }
 export async function transaction<T>(
   db: Database,

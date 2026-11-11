@@ -3,6 +3,7 @@ import { z } from "zod";
 import { Platform, fail, type Actor } from "./platform.js";
 import { paginationSchema } from "./pagination.js";
 import { dubaiDate } from "./eligibility.js";
+import { NotificationService } from "./notifications.js";
 const uuid = z.string().uuid();
 const text = z.string().trim().min(1).max(200);
 const optionalFilter = z
@@ -63,6 +64,17 @@ export const authenticate: Authenticator = async (token) => {
 };
 export function routes(p: Platform, auth: Authenticator = authenticate) {
   const r = Router();
+  // Catalogue responses may include the signed-in family's saved state.
+  r.use((_q,s,next) => { s.setHeader("Cache-Control","private, no-store"); next(); });
+  const catalogueActor = async (authorization?: string): Promise<Actor> => {
+    if(!authorization) return {id:"",role:"public"};
+    const token = authorization.match(/^Bearer (.+)$/)?.[1];
+    if(!token) fail(401,"Sign in to continue.");
+    const user = await auth(token);
+    return p.me(user.id,user.email);
+  };
+  const slug = z.enum(["about","contact","faq","terms","privacy"]);
+  r.get("/content/:slug", async(q,s) => s.json(await p.content(slug.parse(q.params.slug))));
   r.get("/activities", async (q, s) => {
     const filters = paginationSchema
       .extend({
@@ -77,11 +89,11 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
       .strict()
       .parse(q.query);
     s.json(
-      await p.list("activities", { id: "", role: "public" }, filters, filters),
+      await p.list("activities", await catalogueActor(q.headers.authorization), filters, filters),
     );
   });
   r.get("/activities/:id", async (q, s) =>
-    s.json(await p.activity(uuid.parse(q.params.id))),
+    s.json(await p.activity(uuid.parse(q.params.id), await catalogueActor(q.headers.authorization))),
   );
   r.get("/activities/:id/sessions", async (q, s) =>
     s.json(
@@ -116,6 +128,35 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
     s.json(s.locals.actor);
   });
   const paging = (query: unknown) => paginationSchema.strict().parse(query);
+  const notifications = new NotificationService(p.db);
+  r.get("/notifications", async(q,s) => s.json(await notifications.list(actor(s),paging(q.query))));
+  r.post("/notifications/read", async(q,s) => {
+    const body = z.union([
+      z.object({all:z.literal(true)}).strict(),
+      z.object({ids:z.array(uuid).min(1).max(100)}).strict(),
+    ]).parse(q.body);
+    s.json(await notifications.markRead(actor(s),'all' in body ? null : body.ids));
+  });
+  r.get("/support", async(q,s) => {
+    const query = paginationSchema.extend({status:z.enum(["open","in_progress","resolved"]).optional()}).strict().parse(q.query);
+    s.json(await p.support(actor(s),query,query.status));
+  });
+  r.post("/support", async(q,s) => {
+    const body = z.object({topic:text,message:z.string().trim().min(10).max(4000)}).strict().parse(q.body);
+    s.status(201).json(await p.createSupport(actor(s),body.topic,body.message));
+  });
+  r.put("/support/:id", async(q,s) => {
+    const body = z.object({status:z.enum(["open","in_progress","resolved"]),reply:z.string().trim().min(1).max(4000)}).strict().parse(q.body);
+    s.json(await p.replySupport(actor(s),uuid.parse(q.params.id),body.status,body.reply));
+  });
+  r.get("/manage/content/:slug", async(q,s) => {
+    if(actor(s).role !== "admin") fail(403,"Administrator access required.");
+    s.json(await p.content(slug.parse(q.params.slug),actor(s)));
+  });
+  r.put("/manage/content/:slug", async(q,s) => {
+    const body = z.object({title:text,body:z.string().trim().min(1).max(12000),published:z.boolean(),version:z.number().int().nonnegative()}).strict().parse(q.body);
+    s.json(await p.saveContent(actor(s),slug.parse(q.params.slug),body));
+  });
   r.get("/children", async (q, s) =>
     s.json(await p.list("children", actor(s), paging(q.query))),
   );
@@ -236,6 +277,7 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
     const b = z
       .object({
         sessionId: uuid,
+        activityVersion: z.number().int().positive(),
         childIds: z
           .array(uuid)
           .min(1)

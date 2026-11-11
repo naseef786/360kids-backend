@@ -15,7 +15,7 @@ Keep the expiry worker running separately for deadline transitions. Notification
 
 The handshake sends a Supabase access token. The server verifies it and loads the active application profile. User IDs, roles and room names supplied by a client cannot select a recipient. Each connection joins only the room generated from its verified identity. There are no client room-subscription or booking-write events.
 
-Notification rows are created in the same transaction as audit records and domain changes. A rollback leaves no notification. A family sees its own booking/account/support events; a partner sees events for its owned provider and related bookings/listings. Admins receive operational events. Account and child-profile changes stay with the family. REST reads recheck current ownership and role, including historical notices after a role change.
+Notification rows are created in the same transaction as audit records and domain changes. A rollback leaves no notification. A family sees its own booking/account/support events; a partner sees events for its owned provider and active organization memberships. Admins receive operational events. Account and child-profile changes stay with the family. REST reads recheck current ownership, active membership, provider approval and role, including historical notices after revocation.
 
 Socket signals carry only a refresh reason, without child details, receipts or booking contents. Clients obtain current data through the authenticated API. Disabling a profile disconnects it at the next successful sweep, normally within 1.5 seconds. Tokens and active profiles are revalidated every 60 seconds. This is bounded revalidation, not instantaneous token revocation. The web client reconnects when Supabase refreshes its token.
 
@@ -25,8 +25,8 @@ The server permits ten established connections per user and limits handshake att
 
 | Interface                                                | Behavior                                                                |
 | -------------------------------------------------------- | ----------------------------------------------------------------------- |
-| `GET /v1/notifications`                                  | Latest 50 visible notices, unread/total counts and an older-page cursor |
-| `GET /v1/notifications?before=sequence`                  | Earlier notices; the cursor is a positive sequence string               |
+| `GET /v1/notifications`                                  | SQL-paginated visible notices with unread count; default 20, maximum 100 |
+| `GET /v1/notifications?page=2&pageSize=20`                  | Validated page parameters; `{items,total,page,pageSize,pages,unread}`               |
 | `POST /v1/notifications/read` with `{ "ids": ["uuid"] }` | Marks up to 100 owned, currently visible notices read                   |
 | Same endpoint with `{ "all": true }`                     | Marks all currently visible notices read                                |
 | `sync:required`                                          | Refresh on connect or a committed count/role change                     |
