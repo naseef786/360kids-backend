@@ -2,6 +2,7 @@ import { migrate } from "../src/migrations.js";
 import { databaseFor } from "./support/database.js";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { grantFixtureRoles } from "./support/permissions.js";
 import { readFile } from "node:fs/promises";
 import { PGlite } from "@electric-sql/pglite";
 import { Platform, type Actor } from "../src/platform.js";
@@ -30,6 +31,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
   try {
     for (const a of [parent, other, provider, admin]) {
       await p.me(a.id, "synthetic@example.invalid");
+      await grantFixtureRoles(p,a);
       await pg.query("UPDATE app.profiles SET role=$2 WHERE id=$1", [
         a.id,
         a.role,
@@ -134,7 +136,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
           action: "verify",
           version: 3,
         }),
-      /Admin/,
+      /Capability/,
     );
     await p.act(admin, "verify-first", b.id, { action: "verify", version: 3 });
     await p.act(provider, "cancel-first", b.id, {

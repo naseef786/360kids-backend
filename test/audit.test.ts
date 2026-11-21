@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { grantFixtureRoles } from "./support/permissions.js";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createTestDatabase } from "./helpers.js";
@@ -43,7 +44,7 @@ test("migrations are repeatable, checksummed and keep browser roles outside the 
           "SELECT count(*)::int AS total FROM app.schema_migrations",
         )
       ).rows[0].total,
-      8,
+      14,
     );
   } finally {
     await pg.close();
@@ -70,6 +71,9 @@ test("readiness rejects missing migrations, and an injected auth service enables
       "004_private_access_indexes.sql",
     ]);
     assert.equal(await p.ready(), false);
+    const disabledStatus = await (await fetch(url + "/v1/status")).json();
+    assert.equal(disabledStatus.bookingsAvailable, false);
+    assert.equal(disabledStatus.financeEnabled, false);
     const unready = createApp("http://localhost:3000", p, async () => ({
       id: randomUUID(),
       email: "synthetic@example.invalid",
@@ -105,6 +109,7 @@ test("suspended providers cannot publish or acquire places; operational notifica
   try {
     for (const actor of [parent, provider, admin, admin2]) {
       await p.me(actor.id, "synthetic@example.invalid");
+      await grantFixtureRoles(p,actor);
       await p.read("UPDATE app.profiles SET role=$2 WHERE id=$1", [
         actor.id,
         actor.role,
@@ -167,14 +172,14 @@ test("suspended providers cannot publish or acquire places; operational notifica
     );
     const stored = (await p.bookings(parent))[0];
     assert.equal(stored.state, "OFFER_PENDING");
-    assert.equal(stored.held, false);
+    assert.equal(stored.held, true);
     assert.equal(
       (
         await p.read("SELECT allocated FROM app.sessions WHERE id=$1", [
           activity.sessionId,
         ])
       )[0].allocated,
-      0,
+      1,
     );
     await p.approve(admin, business.id, "approved");
     await p.read("UPDATE app.provider_memberships SET active=false WHERE user_id=$1", [provider.id]);

@@ -1,5 +1,7 @@
 # Dashboard notifications
 
+> **Document authority — 17 November 2026:** This file is design/as-built or historical evidence, not a competing release plan. Current scope and workflow rules are [D01–D16](../../docs/DECISIONS.md), with one [implementation plan](../../docs/audit/IMPLEMENTATION_PLAN.md) and [gap map](../../docs/audit/REQUIREMENTS_GAP_ANALYSIS.md). Older proposals, assumptions, future-work lists and test results below do not override that baseline or certify the current release. The selected launch web transport is foreground HTTP polling; the Socket.IO implementation below is not evidence that the active shell uses it.
+
 The API hosts authenticated Socket.IO connections on the same port as HTTP, at `/socket.io`. The Next.js dashboard uses them for saved notification counts and refreshing booking, support and workspace data. This increment does not send email, WhatsApp, mobile push or browser system notifications.
 
 ## Deployment

@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { grantFixtureRoles } from "./support/permissions.js";
 import { createServer } from "node:http";
 import { randomUUID } from "node:crypto";
 import { io, type Socket } from "socket.io-client";
@@ -35,6 +36,7 @@ test(
     const actors: Record<string, Actor> = { parent, provider, other, admin };
     for (const a of Object.values(actors)) {
       await p.me(a.id, "synthetic@example.invalid");
+      await grantFixtureRoles(p,a);
       await p.read("UPDATE app.profiles SET role=$2 WHERE id=$1", [
         a.id,
         a.role,
@@ -259,6 +261,7 @@ test(
       await p.read("UPDATE app.profiles SET role='parent' WHERE id=$1", [
         admin.id,
       ]);
+      await p.read("UPDATE app.platform_role_grants SET active=false WHERE user_id=$1",[admin.id]);
       assert.equal(
         (await notifications.list({ ...admin, role: "parent" })).total,
         0,

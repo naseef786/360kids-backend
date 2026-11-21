@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { grantFixtureRoles } from "./support/permissions.js";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createTestDatabase } from "./helpers.js";
@@ -17,6 +18,7 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
   };
   for (const a of Object.values(actors)) {
     await p.me(a.id, "synthetic@example.invalid");
+      await grantFixtureRoles(p,a);
     await p.read("UPDATE app.profiles SET role=$2 WHERE id=$1", [a.id, a.role]);
   }
   const provider = await p.apply(actors.provider, {
@@ -45,11 +47,15 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
     birthDate: "2018-01-01",
   });
   const server = createApp("http://localhost:3000", p, async (token) => {
-    if (!actors[token])
+    if (!actors[token] && token !== "unverified-email")
       throw Object.assign(new Error("Synthetic invalid identity"), {
         status: 401,
       });
-    return { id: actors[token].id, email: "synthetic@example.invalid" };
+    return {
+      id: token === "unverified-email" ? actors.parent.id : actors[token].id,
+      email: "synthetic@example.invalid",
+      emailVerified: token !== "unverified-email",
+    };
   }).listen(0, "127.0.0.1");
   await once(server, "listening");
   const base =
@@ -81,6 +87,10 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
         policyAccepted: true,
       },
       key = randomUUID();
+    const blocked = await call("/bookings", "unverified-email", body);
+    assert.equal(blocked.status, 403);
+    assert.match((await blocked.json()).message, /Verify your email/);
+    assert.equal((await p.bookings(actors.parent)).length, 0);
     const listing = (await p.list("managed-activities",actors.admin,{page:1,pageSize:20})).items[0];
     await p.updateActivity(actors.admin, activity.id, {
       version: listing.version,

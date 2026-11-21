@@ -1,16 +1,20 @@
 import { transaction, type Connection, type Database } from "./database.js";
 import type { Actor } from "./platform.js";
 import { paginationSchema, type Pagination } from "./pagination.js";
-function member(provider: string, user: string) {
-  return `EXISTS(SELECT 1 FROM app.provider_memberships m JOIN app.providers org ON org.id=m.provider_id WHERE m.provider_id=${provider} AND m.user_id=${user} AND m.active AND org.status='approved')`;
-}
 /** All expressions passed here are server-owned SQL identifiers, never client input. */
 function visible(user: string, role: string) {
-  return `(n.audience='admin' AND ${role}='admin') OR (n.audience='member' AND (
- (n.kind='booking' AND EXISTS(SELECT 1 FROM app.bookings b WHERE b.id=n.subject_id AND (b.parent_id=${user} OR ${member('b.provider_id',user)}))) OR
+  return `(n.audience='admin' AND ${role}<>'public' AND (
+    (n.kind='booking' AND app.has_capability(${user},'bookings.read')) OR
+    (n.kind IN ('activity','correction') AND app.has_capability(${user},'content.manage')) OR
+    (n.kind='support' AND app.has_capability(${user},'support.manage')) OR
+    (n.kind='provider' AND ${role}='admin') OR
+    (n.kind='admin' AND ((n.event='content.updated' AND app.has_capability(${user},'content.manage')) OR
+      (n.event ~ '^(contacts|contact|campaign)\\.' AND ${role}='admin')))
+  )) OR (n.audience='member' AND (
+ (n.kind='booking' AND app.can_access_booking(${user},n.subject_id)) OR
  (n.kind='provider' AND EXISTS(SELECT 1 FROM app.providers p WHERE p.id=n.subject_id AND p.owner_id=${user})) OR
- (n.kind='activity' AND EXISTS(SELECT 1 FROM app.activities a WHERE a.id=n.subject_id AND ${member('a.provider_id',user)})) OR
- (n.kind='correction' AND EXISTS(SELECT 1 FROM app.corrections c WHERE c.id=n.subject_id AND ${member('c.provider_id',user)})) OR
+ (n.kind='activity' AND EXISTS(SELECT 1 FROM app.activities a WHERE a.id=n.subject_id AND app.provider_capability(${user},a.provider_id,a.branch_id,'listings.draft'))) OR
+ (n.kind='correction' AND EXISTS(SELECT 1 FROM app.corrections c JOIN app.activities a ON a.id=c.activity_id WHERE c.id=n.subject_id AND app.provider_capability(${user},a.provider_id,a.branch_id,'listings.draft'))) OR
  (n.kind='support' AND EXISTS(SELECT 1 FROM app.support s WHERE s.id=n.subject_id AND s.owner_id=${user})) OR
  (n.kind='account' AND (n.subject_id=${user} OR EXISTS(SELECT 1 FROM app.children c WHERE c.id=n.subject_id AND c.parent_id=${user})))
 ))`;
@@ -31,17 +35,25 @@ export async function recordNotifications(
   // Fan out in SQL: neither the staff list nor the admin list is loaded into memory.
   await c.query(`WITH recipients AS (
     SELECT 'booking' AS kind,b.parent_id AS recipient_id FROM app.bookings b WHERE b.id=$1
-    UNION SELECT 'booking',m.user_id FROM app.bookings b JOIN app.provider_memberships m ON m.provider_id=b.provider_id JOIN app.providers p ON p.id=m.provider_id WHERE b.id=$1 AND m.active AND p.status='approved'
+    UNION SELECT 'booking',m.user_id FROM app.bookings b JOIN app.provider_memberships m ON m.provider_id=b.provider_id WHERE b.id=$1 AND app.can_access_booking(m.user_id,b.id)
     UNION SELECT 'provider',owner_id FROM app.providers WHERE id=$1
-    UNION SELECT 'activity',m.user_id FROM app.activities a JOIN app.provider_memberships m ON m.provider_id=a.provider_id JOIN app.providers p ON p.id=m.provider_id WHERE a.id=$1 AND m.active AND p.status='approved'
-    UNION SELECT 'correction',m.user_id FROM app.corrections c JOIN app.provider_memberships m ON m.provider_id=c.provider_id JOIN app.providers p ON p.id=m.provider_id WHERE c.id=$1 AND m.active AND p.status='approved'
+    UNION SELECT 'activity',m.user_id FROM app.activities a JOIN app.provider_memberships m ON m.provider_id=a.provider_id WHERE a.id=$1 AND app.provider_capability(m.user_id,a.provider_id,a.branch_id,'listings.draft')
+    UNION SELECT 'correction',m.user_id FROM app.corrections c JOIN app.activities a ON a.id=c.activity_id JOIN app.provider_memberships m ON m.provider_id=c.provider_id WHERE c.id=$1 AND app.provider_capability(m.user_id,a.provider_id,a.branch_id,'listings.draft')
     UNION SELECT 'support',owner_id FROM app.support WHERE id=$1
     UNION SELECT 'account',parent_id FROM app.children WHERE id=$1 AND $3 ~ '^(profile|child|account)\\.'
     UNION SELECT 'account',id FROM app.profiles WHERE id=$1 AND $3 ~ '^(profile|child|account)\\.'
   ), targets AS (
     SELECT recipient_id,kind,'member' AS audience FROM recipients
     UNION ALL SELECT p.id,COALESCE((SELECT kind FROM recipients LIMIT 1),'admin'),'admin'
-      FROM app.profiles p WHERE p.role='admin' AND p.active
+      FROM app.profiles p WHERE p.active AND (
+        (EXISTS(SELECT 1 FROM app.bookings WHERE id=$1) AND app.has_capability(p.id,'bookings.read')) OR
+        (EXISTS(SELECT 1 FROM app.activities WHERE id=$1) AND app.has_capability(p.id,'content.manage')) OR
+        (EXISTS(SELECT 1 FROM app.corrections WHERE id=$1) AND app.has_capability(p.id,'content.manage')) OR
+        (EXISTS(SELECT 1 FROM app.support WHERE id=$1) AND app.has_capability(p.id,'support.manage')) OR
+        (EXISTS(SELECT 1 FROM app.providers WHERE id=$1) AND p.role='admin') OR
+        ($3='content.updated' AND app.has_capability(p.id,'content.manage')) OR
+        ($3 ~ '^(contacts|contact|campaign)\\.' AND p.role='admin')
+      )
       AND $3 !~ '^(profile|child|account)\\.'
       AND NOT EXISTS(SELECT 1 FROM recipients r WHERE r.recipient_id=p.id)
   )

@@ -56,10 +56,17 @@ test("Supabase service outages are retryable and do not masquerade as invalid cr
     globalThis.fetch = async (input) => {
       assert.equal(String(input), "https://auth.example.invalid/auth/v1/user");
       return new Response(
-        JSON.stringify({ id: userId, email: "synthetic@example.invalid" }),
+        JSON.stringify({ id: userId, email: "synthetic@example.invalid", email_confirmed_at: "2026-11-20T00:00:00Z" }),
       );
     };
     assert.equal((await authenticate("synthetic-token")).id, userId);
+    assert.equal((await authenticate("synthetic-token")).emailVerified, true);
+    const token = (claims: object) => `synthetic.${Buffer.from(JSON.stringify(claims)).toString("base64url")}.synthetic`;
+    assert.equal((await authenticate(token({sub:userId,aal:"aal2"}))).assuranceLevel,"aal2");
+    assert.equal((await authenticate(token({sub:randomUUID(),aal:"aal2"}))).assuranceLevel,"aal1");
+    assert.equal((await authenticate(token({sub:userId,user_metadata:{aal:"aal2"}}))).assuranceLevel,"aal1");
+    globalThis.fetch = async () => new Response("{}",{status:401});
+    await assert.rejects(() => authenticate(token({sub:userId,aal:"aal2"})),(error:unknown) => (error as {status:number}).status === 401);
   } finally {
     globalThis.fetch = originalFetch;
     if (url === undefined) delete process.env.SUPABASE_URL;

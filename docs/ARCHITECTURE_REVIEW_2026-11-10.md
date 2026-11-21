@@ -1,5 +1,7 @@
 # Backend architecture review — 10 November 2026
 
+> **Document authority — 17 November 2026:** This file is design/as-built or historical evidence, not a competing release plan. Current scope and workflow rules are [D01–D16](../../docs/DECISIONS.md), with one [implementation plan](../../docs/audit/IMPLEMENTATION_PLAN.md) and [gap map](../../docs/audit/REQUIREMENTS_GAP_ANALYSIS.md). Older proposals, assumptions, future-work lists and test results below do not override that baseline or certify the current release.
+
 ## Verdict and scope
 
 The backend is a working development implementation, not a complete production system. The modular-monolith direction is appropriate for the current product; introducing microservices would add operational complexity without resolving the missing workflows. The supplied attachment was zero bytes, so this review uses the checked-out source, migrations, API consumers and executable tests. Existing uncommitted support/content and web work was preserved.

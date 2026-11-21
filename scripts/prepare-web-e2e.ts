@@ -4,6 +4,7 @@ import { writeFile } from "node:fs/promises";
 import pg from "pg";
 import { connectionOptions } from "../src/database.js";
 import { Platform } from "../src/platform.js";
+import { assertSyntheticTarget } from "../src/synthetic-target.js";
 if (
   process.env.NODE_ENV === "production" ||
   !process.argv.includes("--development-only")
@@ -11,6 +12,7 @@ if (
   throw new Error(
     "Use --development-only with an isolated development project.",
   );
+assertSyntheticTarget(process.env);
 const url = process.env.SUPABASE_URL,
   key = process.env.SUPABASE_SECRET_KEY;
 if (!url || !key)
@@ -53,6 +55,15 @@ try {
       await pool.query("UPDATE app.profiles SET role='admin' WHERE id=$1", [
         id,
       ]);
+      // A display role alone carries no authority. Grant only this isolated
+      // synthetic operator the capabilities exercised by the E2E journey.
+      await pool.query(
+        `INSERT INTO app.platform_role_grants(user_id,role,granted_by,reason)
+         SELECT $1,role,$1,'Isolated development E2E operator'
+         FROM (VALUES ('content'),('support'),('finance')) AS fixture(role)
+         ON CONFLICT DO NOTHING`,
+        [id],
+      );
       await platform.audit(
         { query: (sql, params) => pool.query(sql, params), release() {} },
         { id, role: "admin" },
