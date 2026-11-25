@@ -1,0 +1,11 @@
+CREATE INDEX IF NOT EXISTS children_parent_name_page ON app.children(parent_id,first_name,id);
+CREATE INDEX IF NOT EXISTS activities_title_page ON app.activities(title,id);
+CREATE INDEX IF NOT EXISTS providers_created_page ON app.providers(created_at DESC,id);
+CREATE INDEX IF NOT EXISTS sessions_activity_date_page ON app.sessions(activity_id,starts_at,id);
+CREATE INDEX IF NOT EXISTS bookings_parent_page ON app.bookings(parent_id,created_at DESC,id);
+CREATE INDEX IF NOT EXISTS bookings_provider_page ON app.bookings(provider_id,created_at DESC,id);
+CREATE INDEX IF NOT EXISTS bookings_created_page ON app.bookings(created_at DESC,id);
+CREATE INDEX IF NOT EXISTS saved_user_created_page ON app.saved_activities(user_id,created_at DESC,activity_id);
+CREATE INDEX IF NOT EXISTS audit_created_page ON app.audit(created_at DESC,id);
+CREATE INDEX IF NOT EXISTS contacts_created_page ON app.contacts(created_at DESC,id);
+CREATE INDEX IF NOT EXISTS campaigns_created_page ON app.campaigns(created_at DESC,id);

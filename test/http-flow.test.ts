@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { grantFixtureRoles } from "./support/permissions.js";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { createTestDatabase } from "./helpers.js";
@@ -17,6 +18,7 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
   };
   for (const a of Object.values(actors)) {
     await p.me(a.id, "synthetic@example.invalid");
+      await grantFixtureRoles(p,a);
     await p.read("UPDATE app.profiles SET role=$2 WHERE id=$1", [a.id, a.role]);
   }
   const provider = await p.apply(actors.provider, {
@@ -45,11 +47,15 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
     birthDate: "2018-01-01",
   });
   const server = createApp("http://localhost:3000", p, async (token) => {
-    if (!actors[token])
+    if (!actors[token] && token !== "unverified-email")
       throw Object.assign(new Error("Synthetic invalid identity"), {
         status: 401,
       });
-    return { id: actors[token].id, email: "synthetic@example.invalid" };
+    return {
+      id: token === "unverified-email" ? actors.parent.id : actors[token].id,
+      email: "synthetic@example.invalid",
+      emailVerified: token !== "unverified-email",
+    };
   }).listen(0, "127.0.0.1");
   await once(server, "listening");
   const base =
@@ -71,6 +77,9 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
       body: body === undefined ? undefined : JSON.stringify(body),
     });
   try {
+    const catalogueResponse = await call("/activities","parent");
+    assert.equal(catalogueResponse.status,200);
+    assert.match(catalogueResponse.headers.get("cache-control") ?? "",/private, no-store/);
     const body = {
         sessionId: activity.sessionId,
         activityVersion: 1,
@@ -78,8 +87,12 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
         policyAccepted: true,
       },
       key = randomUUID();
-    const listing = (await p.managementCatalog(actors.admin))[0];
-    await p.editActivity(actors.admin, activity.id, {
+    const blocked = await call("/bookings", "unverified-email", body);
+    assert.equal(blocked.status, 403);
+    assert.match((await blocked.json()).message, /Verify your email/);
+    assert.equal((await p.bookings(actors.parent)).length, 0);
+    const listing = (await p.list("managed-activities",actors.admin,{page:1,pageSize:20})).items[0];
+    await p.updateActivity(actors.admin, activity.id, {
       version: listing.version,
       title: listing.title,
       description: listing.description,
@@ -107,9 +120,9 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
     assert.equal(duplicate.status, 409);
     assert.match(
       (await duplicate.json()).message,
-      /already has an active request/,
+      /active record already exists/,
     );
-    assert.deepEqual(await (await call("/bookings", "other")).json(), []);
+    assert.deepEqual((await (await call("/bookings", "other")).json()).items, []);
     const unauthorized = await call(
       "/bookings/" + booking.id + "/actions",
       "other",
@@ -124,10 +137,10 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
     assert.equal(accepted.status, 200);
     assert.equal((await accepted.json()).state, "PAYMENT_DUE");
     const parentBookings = await (await call("/bookings", "parent")).json();
-    assert.equal(parentBookings[0].amount_fils, 12000);
-    assert.equal(parentBookings[0].snapshot.listingVersion, 2);
-    assert.equal(parentBookings[0].held, true);
-    assert.equal(parentBookings[0].state, "PAYMENT_DUE");
+    assert.equal(parentBookings.items[0].amount_fils, 12000);
+    assert.equal(parentBookings.items[0].snapshot.listingVersion, 2);
+    assert.equal(parentBookings.items[0].held, true);
+    assert.equal(parentBookings.items[0].state, "PAYMENT_DUE");
     assert.equal(JSON.stringify(parentBookings).includes("birth_date"), false);
     const proof = await call("/bookings/" + booking.id + "/actions", "parent", {
       action: "proof",
@@ -146,7 +159,7 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
       0,
     );
     assert.equal(
-      (await call("/bookings/" + booking.id + "/history", "other")).status,
+      (await call("/bookings/" + booking.id + "", "other")).status,
       404,
     );
     const cancelled = await call(
@@ -197,17 +210,101 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
       "family",
     );
     const family = await (
-      await call("/bookings?scope=family", "provider")
+      await call("/bookings?scope=parent", "provider")
     ).json();
-    assert.equal(family.length, 1);
-    assert.equal(family[0].parent_id, actors.provider.id);
+    assert.equal(family.items.length, 1);
+    assert.equal(family.items[0].parent_id, actors.provider.id);
     assert.equal(
-      (await (await call("/bookings?scope=provider", "provider")).json())
-        .length,
+      (await (await call("/bookings?scope=partner", "provider")).json())
+        .items.length,
       2,
     );
     assert.equal(
-      (await (await call("/bookings?scope=family", "admin")).json()).length,
+      (await (await call("/bookings?scope=parent", "admin")).json()).items.length,
+      0,
+    );
+
+    // Provider session creation with cutoff validation, and parent reject-offer flow
+    const draftRes = await call("/activities", "provider", {
+      providerId: provider.id,
+      title: "Draft Robotics Club",
+      description: "Synthetic draft robotics club.",
+      category: "STEM",
+      area: "Dubai",
+      minAge: 6,
+      maxAge: 12,
+      priceFils: 15000,
+      policy: "Synthetic draft policy.",
+      published: false,
+      startsAt: "2030-06-01T12:00:00Z",
+      cutoffAt: "2030-05-31T12:00:00Z",
+      capacity: 4,
+    });
+    assert.equal(draftRes.status, 201);
+    const draftActivity = await draftRes.json();
+
+    const badSession = await call(`/activities/${draftActivity.id}/sessions`, "provider", {
+      startsAt: "2030-06-02T10:00:00Z",
+      cutoffAt: "2030-06-03T10:00:00Z",
+      capacity: 5,
+    });
+    assert.equal(badSession.status, 422);
+
+    const goodSession = await call(`/activities/${draftActivity.id}/sessions`, "provider", {
+      startsAt: "2030-06-02T12:00:00Z",
+      cutoffAt: "2030-06-01T12:00:00Z",
+      capacity: 5,
+    });
+    assert.equal(goodSession.status, 201);
+
+    const publishedEditBlocked = await fetch(`${base}/activities/${activity.id}`, {
+      method: "PUT",
+      headers: {
+        Authorization: "Bearer provider",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        title: "Unauthorized edit",
+        description: "Provider cannot edit published listing without content review.",
+        category: "Sports",
+        area: "Dubai",
+        minAge: 1,
+        maxAge: 17,
+        priceFils: 12000,
+        policy: "Updated synthetic terms.",
+      }),
+    });
+    assert.equal(publishedEditBlocked.status, 403);
+
+    const offerReq = await call("/bookings", "parent", {
+      sessionId: activity.sessionId,
+      activityVersion: 2,
+      childIds: [child.id],
+      policyAccepted: true,
+    });
+    assert.equal(offerReq.status, 201);
+    const offerBooking = await offerReq.json();
+    const sentOffer = await call(`/bookings/${offerBooking.id}/actions`, "provider", {
+      action: "offer",
+      version: 1,
+      amountFils: 9500,
+      reason: "Early bird offer",
+    });
+    assert.equal(sentOffer.status, 200);
+    assert.equal((await sentOffer.json()).state, "OFFER_PENDING");
+    assert.equal(
+      (await p.read("SELECT allocated FROM app.sessions WHERE id=$1", [activity.sessionId]))[0].allocated,
+      1,
+    );
+    const rejectedOffer = await call(`/bookings/${offerBooking.id}/actions`, "parent", {
+      action: "reject-offer",
+      version: 2,
+      reason: "Schedule does not fit",
+    });
+    assert.equal(rejectedOffer.status, 200);
+    assert.equal((await rejectedOffer.json()).state, "CANCELLED");
+    assert.equal(
+      (await p.read("SELECT allocated FROM app.sessions WHERE id=$1", [activity.sessionId]))[0].allocated,
       0,
     );
   } finally {

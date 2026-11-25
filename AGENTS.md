@@ -2,6 +2,8 @@
 
 Use TypeScript and the existing repository conventions. Keep changes focused and test the normal flow and relevant failures.
 
+All API lists that can grow must paginate in SQL. Use validated `page` and `pageSize` (default 20, maximum 100), deterministic ordering with an ID tie-breaker, and `{items,total,page,pageSize,pages}` responses. Apply authorization and filters before counting/paging. Never load a whole table and paginate in memory. Paginate related lists such as sessions and organization members separately.
+
 This is a development implementation; production readiness is tracked in docs/IMPLEMENTATION_STATUS.md. Mark sample data and unfinished functionality clearly. Do not collect real child data, accept payments, or send messages from this scaffold.
 
 Business permissions, amounts, deadlines and booking status changes belong in the backend. A submitted request is not confirmed. Keep booking, payment, refund and subscription records separate.
