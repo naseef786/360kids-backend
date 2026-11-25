@@ -348,6 +348,7 @@ export function routes(p: Platform, auth: Authenticator = authenticate, checkout
           "accept",
           "offer",
           "accept-offer",
+          "reject-offer",
           "decline",
           "proof",
           "verify",

@@ -433,12 +433,21 @@ export class Platform {
     id: string,
     b: { startsAt: string; cutoffAt: string; capacity: number },
   ) {
+    if (new Date(b.cutoffAt) > new Date(b.startsAt))
+      fail(422, "Request cutoff cannot be later than session start time.");
     return transaction(this.db, async (c) => {
-      await requireCapability(c,a.id,"content.manage");
       const activity = (
-        await c.query("SELECT id FROM app.activities WHERE id=$1", [id])
+        await c.query(
+          `SELECT id,
+            app.has_capability($2,'content.manage') AS content,
+            app.provider_capability($2,provider_id,branch_id,'listings.draft') AS draft
+          FROM app.activities WHERE id=$1`,
+          [id, a.id],
+        )
       ).rows[0];
       if (!activity) fail(404, "Activity not found.");
+      if (!activity.content && !activity.draft)
+        fail(403, "Content or listing capability required.");
       const sessionId = uid();
       await c.query(
         "INSERT INTO app.sessions(id,activity_id,starts_at,cutoff_at,capacity) VALUES($1,$2,$3,$4,$5)",
@@ -773,6 +782,13 @@ export class Platform {
           due = new Date(Math.min(now.getTime() + 86400000, cutoff.getTime()));
           paymentStarted = now;
           state = "PAYMENT_DUE";
+        } else if (b.action === "reject-offer") {
+          if (!parent) fail(403, "Parent approval required.");
+          if (state !== "OFFER_PENDING" || !offer)
+            fail(409, "No current offer.");
+          if (new Date(offer.expiresAt) <= now)
+            fail(409, "Offer window is closed.");
+          state = "CANCELLED";
         } else if (b.action === "decline") {
           if (!provider && !admin) fail(403, "Provider access required.");
           if (!["REQUESTED", "OFFER_PENDING"].includes(state) ||

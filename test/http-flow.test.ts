@@ -223,6 +223,90 @@ test("HTTP family request, partner acceptance, finance gate, scoped notification
       (await (await call("/bookings?scope=parent", "admin")).json()).items.length,
       0,
     );
+
+    // Provider session creation with cutoff validation, and parent reject-offer flow
+    const draftRes = await call("/activities", "provider", {
+      providerId: provider.id,
+      title: "Draft Robotics Club",
+      description: "Synthetic draft robotics club.",
+      category: "STEM",
+      area: "Dubai",
+      minAge: 6,
+      maxAge: 12,
+      priceFils: 15000,
+      policy: "Synthetic draft policy.",
+      published: false,
+      startsAt: "2030-06-01T12:00:00Z",
+      cutoffAt: "2030-05-31T12:00:00Z",
+      capacity: 4,
+    });
+    assert.equal(draftRes.status, 201);
+    const draftActivity = await draftRes.json();
+
+    const badSession = await call(`/activities/${draftActivity.id}/sessions`, "provider", {
+      startsAt: "2030-06-02T10:00:00Z",
+      cutoffAt: "2030-06-03T10:00:00Z",
+      capacity: 5,
+    });
+    assert.equal(badSession.status, 422);
+
+    const goodSession = await call(`/activities/${draftActivity.id}/sessions`, "provider", {
+      startsAt: "2030-06-02T12:00:00Z",
+      cutoffAt: "2030-06-01T12:00:00Z",
+      capacity: 5,
+    });
+    assert.equal(goodSession.status, 201);
+
+    const publishedEditBlocked = await fetch(`${base}/activities/${activity.id}`, {
+      method: "PUT",
+      headers: {
+        Authorization: "Bearer provider",
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        title: "Unauthorized edit",
+        description: "Provider cannot edit published listing without content review.",
+        category: "Sports",
+        area: "Dubai",
+        minAge: 1,
+        maxAge: 17,
+        priceFils: 12000,
+        policy: "Updated synthetic terms.",
+      }),
+    });
+    assert.equal(publishedEditBlocked.status, 403);
+
+    const offerReq = await call("/bookings", "parent", {
+      sessionId: activity.sessionId,
+      activityVersion: 2,
+      childIds: [child.id],
+      policyAccepted: true,
+    });
+    assert.equal(offerReq.status, 201);
+    const offerBooking = await offerReq.json();
+    const sentOffer = await call(`/bookings/${offerBooking.id}/actions`, "provider", {
+      action: "offer",
+      version: 1,
+      amountFils: 9500,
+      reason: "Early bird offer",
+    });
+    assert.equal(sentOffer.status, 200);
+    assert.equal((await sentOffer.json()).state, "OFFER_PENDING");
+    assert.equal(
+      (await p.read("SELECT allocated FROM app.sessions WHERE id=$1", [activity.sessionId]))[0].allocated,
+      1,
+    );
+    const rejectedOffer = await call(`/bookings/${offerBooking.id}/actions`, "parent", {
+      action: "reject-offer",
+      version: 2,
+      reason: "Schedule does not fit",
+    });
+    assert.equal(rejectedOffer.status, 200);
+    assert.equal((await rejectedOffer.json()).state, "CANCELLED");
+    assert.equal(
+      (await p.read("SELECT allocated FROM app.sessions WHERE id=$1", [activity.sessionId]))[0].allocated,
+      0,
+    );
   } finally {
     server.closeAllConnections();
     await new Promise<void>((resolve) => server.close(() => resolve()));
