@@ -6,7 +6,7 @@ export interface Connection {
     sql: string,
     params?: unknown[],
   ): Promise<{ rows: Record<string, any>[]; rowCount?: number | null }>;
-  release(): void;
+  release(destroy?: boolean): void;
 }
 export interface Database {
   connect(): Promise<Connection>;
@@ -78,25 +78,54 @@ export function connectionOptions(
           },
     max: 10,
     connectionTimeoutMillis: 5000,
+    statement_timeout: 15000,
+    idle_in_transaction_session_timeout: 15000,
   };
 }
 export function database(): Database {
-  return new pg.Pool(connectionOptions());
+  const pool = new pg.Pool(connectionOptions());
+  // An idle connection error must not become an unhandled EventEmitter error.
+  pool.on("error", () => console.error("Idle database connection failed; the pool will reconnect."));
+  return pool;
 }
 export async function transaction<T>(
   db: Database,
   fn: (c: Connection) => Promise<T>,
 ): Promise<T> {
   const c = await db.connect();
+  let destroy = false;
   try {
     await c.query("BEGIN");
     const result = await fn(c);
     await c.query("COMMIT");
     return result;
   } catch (e) {
-    await c.query("ROLLBACK");
+    destroy = fatalConnectionError(e);
+    try {
+      await c.query("ROLLBACK");
+    } catch {
+      // A failed rollback leaves connection state unknown. Preserve the root error.
+      destroy = true;
+    }
     throw e;
   } finally {
-    c.release();
+    c.release(destroy);
   }
+}
+
+function fatalConnectionError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const { code, severity, message } = error as {
+    code?: string;
+    severity?: string;
+    message?: string;
+  };
+  return (
+    severity === "FATAL" || severity === "PANIC" ||
+    Boolean(code && (
+      /^08/.test(code) ||
+      ["57P01", "57P02", "57P03", "ECONNRESET", "EPIPE", "ETIMEDOUT", "ECONNREFUSED"].includes(code)
+    )) ||
+    /connection (?:terminated|closed)|client (?:is not queryable|has already been connected)/i.test(message ?? "")
+  );
 }

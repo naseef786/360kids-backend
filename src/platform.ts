@@ -2,9 +2,13 @@ import { randomUUID, createHash } from "node:crypto";
 import { transaction, type Database, type Connection } from "./database.js";
 import { ageOnDate, possibleAges, dubaiDate } from "./eligibility.js";
 import type { Pagination } from "./pagination.js";
+import { recordNotifications } from "./notifications.js";
+import { migrationsReady } from "./migrations.js";
+import { requireCapability, requireStepUp, type Capability } from "./permissions.js";
 export interface Actor {
   id: string;
   role: string;
+  assuranceLevel?: "aal1" | "aal2";
 }
 export interface CatalogFilters {
   q?: string;
@@ -14,10 +18,22 @@ export interface CatalogFilters {
   limit?: number;
   offset?: number;
 }
-const bookingScope = `($2='admin' OR b.parent_id=$1 OR EXISTS(
-  SELECT 1 FROM app.provider_memberships m JOIN app.providers p ON p.id=m.provider_id
-  WHERE m.provider_id=b.provider_id AND m.user_id=$1 AND m.active AND p.status='approved'
-))`;
+const bookingScope = `($2::text <> 'public' AND app.can_access_booking($1,b.id))`;
+const projectedChildren = `CASE WHEN b.parent_id=$1 THEN b.snapshot->'children'
+  WHEN app.provider_capability($1,b.provider_id,act.branch_id,'bookings.read',b.id) THEN
+    (SELECT COALESCE(jsonb_agg(jsonb_build_object(
+      'firstName',CASE WHEN b.state='CONFIRMED' THEN child.first_name ELSE 'Participant '||child.n END,
+      'surname',CASE WHEN b.state='CONFIRMED' THEN child.surname ELSE NULL END,
+      'age',CASE WHEN child.birth_date IS NOT NULL THEN
+        EXTRACT(YEAR FROM age((s.starts_at AT TIME ZONE 'Asia/Dubai')::date,child.birth_date))::int
+        ELSE NULL END,'eligible',true) ORDER BY child.n),'[]'::jsonb)
+      FROM (SELECT x.*,row_number() OVER(ORDER BY x.id) AS n FROM app.participants j
+        JOIN app.children x ON x.id=j.child_id WHERE j.booking_id=b.id) child)
+  ELSE '[]'::jsonb END`;
+const bookingFields = `b.id,CASE WHEN b.parent_id=$1 THEN b.parent_id ELSE NULL END AS parent_id,
+  b.provider_id,b.session_id,b.state,b.version,b.quantity,b.amount_fils,b.offer,
+  b.response_due_at,b.payment_due_at,b.review_due_at,b.payment_started_at,b.held,b.created_at,
+  jsonb_set(b.snapshot,'{children}',${projectedChildren}) AS snapshot`;
 export function fail(status: number, message: string): never {
   throw Object.assign(new Error(message), { status });
 }
@@ -29,11 +45,85 @@ export class Platform {
   ) {}
   async ready() {
     try {
-      await this.read("SELECT 1");
-      return true;
+      return await migrationsReady(this.db);
     } catch {
       return false;
     }
+  }
+  async support(a: Actor, paging: Pagination, status?: string) {
+    return this.page("SELECT * FROM app.support WHERE (app.has_capability($1,'support.manage') OR owner_id=$1) AND ($2::text IS NULL OR status=$2) ORDER BY created_at DESC,id", [a.id,status ?? null], paging);
+  }
+  async createSupport(a: Actor, topic: string, message: string) {
+    return transaction(this.db, async c => {
+      const id = uid();
+      await c.query("INSERT INTO app.support(id,owner_id,topic,message) VALUES($1,$2,$3,$4)", [id,a.id,topic,message]);
+      await this.audit(c,a,id,"support.created");
+      return { id };
+    });
+  }
+  async createContact(input: {name:string;email:string;topic:string;message:string}, key: string) {
+    const bodyHash = createHash("sha256").update(JSON.stringify(input)).digest("hex");
+    return transaction(this.db, async c => {
+      const id = uid();
+      const result = await c.query(
+        `INSERT INTO app.contact_submissions(id,request_key,body_hash,name,email,topic,message,email_status,email_next_attempt_at)
+         VALUES($1,$2,$3,$4,$5,$6,$7,'pending',now())
+         ON CONFLICT(request_key) DO UPDATE SET request_key=EXCLUDED.request_key
+         RETURNING id,body_hash`,
+        [id,key,bodyHash,input.name,input.email,input.topic,input.message],
+      );
+      if(result.rows[0].body_hash !== bodyHash) fail(409,"This request key was already used for another message.");
+      await c.query(`INSERT INTO app.contact_acknowledgments(contact_id) VALUES($1)
+        ON CONFLICT(contact_id) DO NOTHING`,[result.rows[0].id]);
+      return {id:result.rows[0].id};
+    });
+  }
+  async contactSubmissions(a: Actor, paging: Pagination, status?: string) {
+    await this.require(a,"support.manage");
+    return this.page(
+      `SELECT c.id,c.name,c.email,c.topic,c.message,c.status,c.email_status,c.email_attempts,
+        c.email_accepted_at,c.created_at,a.status AS ack_status,a.attempts AS ack_attempts,a.accepted_at AS ack_accepted_at
+       FROM app.contact_submissions c LEFT JOIN app.contact_acknowledgments a ON a.contact_id=c.id
+       WHERE app.has_capability($1,'support.manage') AND ($2::text IS NULL OR c.status=$2)
+       ORDER BY c.created_at DESC,c.id`,
+      [a.id,status ?? null],paging,
+    );
+  }
+  async updateContact(a: Actor,id:string,status:string) {
+    return transaction(this.db, async c => {
+      await requireCapability(c,a.id,"support.manage");
+      const result=await c.query(
+        "UPDATE app.contact_submissions SET status=$2,updated_at=now() WHERE id=$1 RETURNING id",
+        [id,status],
+      );
+      if(!result.rows.length) fail(404,"Contact message not found.");
+      await this.audit(c,a,id,"contact.updated",{status});
+      return {id};
+    });
+  }
+  async replySupport(a: Actor, id: string, status: string, reply: string) {
+    return transaction(this.db, async c => {
+      await requireCapability(c,a.id,"support.manage");
+      const result = await c.query("UPDATE app.support SET status=$2,reply=$3,updated_at=now() WHERE id=$1 RETURNING id", [id,status,reply]);
+      if(!result.rows.length) fail(404,"Support request not found.");
+      await this.audit(c,a,id,"support.updated");
+      return { id };
+    });
+  }
+  async content(slug: string, a?: Actor) {
+    const rows = await this.read("SELECT * FROM app.content WHERE slug=$1 AND (app.has_capability($2,'content.manage') OR published)", [slug,a?.id ?? null]);
+    return rows[0] ?? null;
+  }
+  async saveContent(a: Actor, slug: string, body: {title:string;body:string;published:boolean;version:number}) {
+    return transaction(this.db, async c => {
+      await requireCapability(c,a.id,"content.manage");
+      const result = await c.query(`INSERT INTO app.content(slug,title,body,published) SELECT $1,$2,$3,$4 WHERE $5=0
+        ON CONFLICT(slug) DO NOTHING RETURNING *`, [slug,body.title,body.body,body.published,body.version]);
+      const rows = body.version === 0 ? result.rows : (await c.query("UPDATE app.content SET title=$2,body=$3,published=$4,version=version+1,updated_at=now() WHERE slug=$1 AND version=$5 RETURNING *", [slug,body.title,body.body,body.published,body.version])).rows;
+      if(!rows.length) fail(409,"This page changed. Reload before editing again.");
+      await this.audit(c,a,a.id,"content.updated",{slug});
+      return rows[0];
+    });
   }
   async read(sql: string, params: unknown[] = []) {
     const c = await this.db.connect();
@@ -50,10 +140,12 @@ export class Platform {
     action: string,
     details: unknown = {},
   ) {
+    const auditId = uid();
     await c.query(
       "INSERT INTO app.audit(id,actor_id,subject_id,action,details) VALUES($1,$2,$3,$4,$5)",
-      [uid(), a.id, subject, action, JSON.stringify(details)],
+      [auditId, a.id, subject, action, JSON.stringify(details)],
     );
+    await recordNotifications(c, auditId, subject, action);
   }
   async page(sql: string, params: unknown[], paging: Pagination) {
     const n = params.length;
@@ -96,7 +188,7 @@ export class Platform {
     }
     if (resource === "activities")
       return this.page(
-        `SELECT a.*,p.name AS provider_name FROM app.activities a JOIN app.providers p ON p.id=a.provider_id
+        `SELECT a.*,p.name AS provider_name,EXISTS(SELECT 1 FROM app.saved_activities saved WHERE saved.activity_id=a.id AND saved.user_id=$5::uuid) AS is_saved FROM app.activities a JOIN app.providers p ON p.id=a.provider_id
       WHERE a.published AND p.status='approved'
       AND ($1::text IS NULL OR strpos(lower(a.title||' '||a.description||' '||a.category||' '||a.area),lower($1))>0)
       AND ($2::text IS NULL OR lower(a.category)=lower($2)) AND ($3::text IS NULL OR lower(a.area)=lower($3))
@@ -106,6 +198,7 @@ export class Platform {
           filters.category ?? null,
           filters.area ?? null,
           filters.age ?? null,
+          a.role === "public" ? null : a.id,
         ],
         paging,
       );
@@ -117,8 +210,9 @@ export class Platform {
       );
     if (resource === "bookings")
       return this.page(
-        `SELECT b.* FROM app.bookings b WHERE ${bookingScope}
-      AND ($3='all' OR ($3='parent' AND b.parent_id=$1) OR ($3='partner' AND EXISTS(SELECT 1 FROM app.provider_memberships m JOIN app.providers p ON p.id=m.provider_id WHERE m.provider_id=b.provider_id AND m.user_id=$1 AND m.active AND p.status='approved')))
+        `SELECT ${bookingFields} FROM app.bookings b JOIN app.sessions s ON s.id=b.session_id
+          JOIN app.activities act ON act.id=s.activity_id WHERE ${bookingScope}
+      AND ($3='all' OR ($3='parent' AND b.parent_id=$1) OR ($3='partner' AND EXISTS(SELECT 1 FROM app.sessions s JOIN app.activities a ON a.id=s.activity_id WHERE s.id=b.session_id AND app.provider_capability($1,b.provider_id,a.branch_id,'bookings.read',b.id))))
       AND ($4::text IS NULL OR b.state=$4)
       ORDER BY b.created_at DESC,b.id`,
         [a.id, a.role, filters.scope ?? "all", filters.state ?? null],
@@ -126,7 +220,7 @@ export class Platform {
       );
     if (resource === "providers")
       return this.page(
-        `SELECT p.* FROM app.providers p WHERE (p.owner_id=$1 OR $2='admin' OR
+        `SELECT p.* FROM app.providers p WHERE (p.owner_id=$1 OR $2='admin' OR app.has_capability($1,'content.manage') OR
       (p.status='approved' AND EXISTS(SELECT 1 FROM app.provider_memberships m WHERE m.provider_id=p.id AND m.user_id=$1 AND m.active)))
       AND ($3::text IS NULL OR p.status=$3) AND (NOT $4::boolean OR p.owner_id=$1)
       ORDER BY p.created_at DESC,p.id`,
@@ -143,8 +237,8 @@ export class Platform {
     if (resource === "managed-activities")
       return this.page(
         `SELECT a.*,p.name AS provider_name FROM app.activities a JOIN app.providers p ON p.id=a.provider_id
-      WHERE $2='admin' OR (p.status='approved' AND EXISTS(SELECT 1 FROM app.provider_memberships m WHERE m.provider_id=p.id AND m.user_id=$1 AND m.active)) ORDER BY a.title,a.id`,
-        [a.id, a.role],
+      WHERE app.has_capability($1,'content.manage') OR app.provider_capability($1,a.provider_id,a.branch_id,'listings.draft') ORDER BY a.title,a.id`,
+        [a.id],
         paging,
       );
     if (resource === "members") {
@@ -153,17 +247,29 @@ export class Platform {
       );
       return this.page(
         `SELECT m.user_id,m.role,m.active,p.email FROM app.provider_memberships m JOIN app.profiles p ON p.id=m.user_id
-        WHERE m.provider_id=$1 AND ($2='admin' OR EXISTS(SELECT 1 FROM app.providers o JOIN app.provider_memberships own ON own.provider_id=o.id
-          WHERE o.id=m.provider_id AND o.owner_id=$3 AND o.status='approved' AND own.user_id=$3 AND own.role='owner' AND own.active))
+        WHERE m.provider_id=$1 AND EXISTS(SELECT 1 FROM app.providers o JOIN app.provider_memberships own ON own.provider_id=o.id
+          WHERE o.id=m.provider_id AND o.owner_id=$2 AND o.status='approved' AND own.user_id=$2 AND own.role='owner' AND own.active)
         ORDER BY m.role,p.email,m.user_id`,
-        [filters.providerId, a.role, a.id],
+        [filters.providerId, a.id],
         paging,
       );
     }
-    this.admin(a);
+    if (resource === "refunds" || resource === "subscriptions" || resource === "payment-exceptions") {
+      await this.require(a,"payments.read");
+    } else if (resource === "corrections") {
+      await this.require(a,"content.manage");
+    } else {
+      this.admin(a);
+      // Audit details can include finance references; generic admins cannot read them.
+      if (resource === "audit") await this.require(a,"payments.read");
+    }
     const adminLists: Record<string, string> = {
       audit: "SELECT * FROM app.audit ORDER BY created_at DESC,id",
       refunds: "SELECT * FROM app.refunds ORDER BY status,id",
+      "payment-exceptions": `SELECT e.id,e.booking_id,e.reason,e.status,e.created_at,
+        p.reference,p.amount_fils,p.status AS payment_status,b.state AS booking_state
+        FROM app.payment_exceptions e JOIN app.payments p ON p.id=e.payment_id
+        JOIN app.bookings b ON b.id=e.booking_id ORDER BY e.created_at DESC,e.id`,
       contacts:
         "SELECT id,name,right(phone,4) AS phone_suffix,marketing,suppressed FROM app.contacts ORDER BY created_at DESC,id",
       campaigns: "SELECT * FROM app.campaigns ORDER BY created_at DESC,id",
@@ -178,10 +284,13 @@ export class Platform {
   admin(a: Actor) {
     if (a.role !== "admin") fail(403, "Admin access required.");
   }
+  async require(a: Actor, capability: Capability) {
+    return transaction(this.db,c => requireCapability(c,a.id,capability));
+  }
   async me(id: string, email: string) {
     return transaction(this.db, async (c) => {
       await c.query(
-        "INSERT INTO app.profiles(id,email) VALUES($1,$2) ON CONFLICT(id) DO NOTHING",
+        "INSERT INTO app.profiles(id,email) VALUES($1,$2) ON CONFLICT(id) DO UPDATE SET email=EXCLUDED.email",
         [id, email],
       );
       const p = (
@@ -201,7 +310,8 @@ export class Platform {
       const roles = ["parent"];
       if (hasPartner) roles.push("partner");
       if (p.role === "admin") roles.push("superadmin");
-      return { ...p, roles };
+      const capabilities = (await c.query(`SELECT DISTINCT c.capability FROM app.platform_role_grants g JOIN app.role_capabilities c ON c.role=g.role WHERE g.user_id=$1 AND g.active ORDER BY c.capability`,[id])).rows.map(row => row.capability as string);
+      return { ...p, id: p.id as string, role: p.role as string, email: p.email as string, roles, capabilities };
     });
   }
   catalog(filters: CatalogFilters = {}) {
@@ -224,12 +334,12 @@ export class Platform {
       ],
     );
   }
-  async activity(id: string) {
+  async activity(id: string, actor?: Actor) {
     const result = await this.read(
-      `SELECT a.*,p.name AS provider_name
+      `SELECT a.*,p.name AS provider_name,EXISTS(SELECT 1 FROM app.saved_activities saved WHERE saved.activity_id=a.id AND saved.user_id=$2::uuid) AS is_saved
        FROM app.activities a JOIN app.providers p ON p.id=a.provider_id
        WHERE a.id=$1 AND a.published AND p.status='approved'`,
-      [id],
+      [id,actor?.role === "public" ? null : actor?.id ?? null],
     );
     if (!result.length) fail(404, "Activity not found.");
     return result[0];
@@ -269,17 +379,16 @@ export class Platform {
     return this.read(
       `SELECT a.*,p.name AS provider_name,COALESCE((SELECT json_agg(s ORDER BY starts_at) FROM app.sessions s WHERE s.activity_id=a.id),'[]') AS sessions
       FROM app.activities a JOIN app.providers p ON p.id=a.provider_id
-      WHERE $2='admin' OR (p.status='approved' AND EXISTS(SELECT 1 FROM app.provider_memberships m
-        WHERE m.provider_id=p.id AND m.user_id=$1 AND m.active)) ORDER BY a.title,a.id LIMIT 200`,
-      [a.id, a.role],
+      WHERE app.has_capability($1,'content.manage') OR app.provider_capability($1,a.provider_id,a.branch_id,'listings.draft') ORDER BY a.title,a.id LIMIT 200`,
+      [a.id],
     );
   }
   async publishActivity(a: Actor, id: string, published: boolean) {
-    this.admin(a);
     return transaction(this.db, async (c) => {
+      await requireCapability(c,a.id,"content.manage");
       const result = (
         await c.query(
-          `UPDATE app.activities SET published=$2 WHERE id=$1
+          `UPDATE app.activities SET published=$2,version=version+1 WHERE id=$1
         AND (NOT $2 OR EXISTS(SELECT 1 FROM app.providers p WHERE p.id=provider_id AND p.status='approved')) RETURNING id,published`,
           [id, published],
         )
@@ -296,11 +405,11 @@ export class Platform {
     });
   }
   async updateActivity(a: Actor, id: string, b: Record<string, any>) {
-    this.admin(a);
     return transaction(this.db, async (c) => {
+      await requireCapability(c,a.id,"content.manage");
       const result = (
         await c.query(
-          `UPDATE app.activities SET title=$2,description=$3,category=$4,area=$5,min_age=$6,max_age=$7,price_fils=$8,policy=$9 WHERE id=$1 RETURNING id`,
+          `UPDATE app.activities SET title=$2,description=$3,category=$4,area=$5,min_age=$6,max_age=$7,price_fils=$8,policy=$9,version=version+1 WHERE id=$1 RETURNING id,version`,
           [
             id,
             b.title,
@@ -324,12 +433,21 @@ export class Platform {
     id: string,
     b: { startsAt: string; cutoffAt: string; capacity: number },
   ) {
-    this.admin(a);
+    if (new Date(b.cutoffAt) > new Date(b.startsAt))
+      fail(422, "Request cutoff cannot be later than session start time.");
     return transaction(this.db, async (c) => {
       const activity = (
-        await c.query("SELECT id FROM app.activities WHERE id=$1", [id])
+        await c.query(
+          `SELECT id,
+            app.has_capability($2,'content.manage') AS content,
+            app.provider_capability($2,provider_id,branch_id,'listings.draft') AS draft
+          FROM app.activities WHERE id=$1`,
+          [id, a.id],
+        )
       ).rows[0];
       if (!activity) fail(404, "Activity not found.");
+      if (!activity.content && !activity.draft)
+        fail(403, "Content or listing capability required.");
       const sessionId = uid();
       await c.query(
         "INSERT INTO app.sessions(id,activity_id,starts_at,cutoff_at,capacity) VALUES($1,$2,$3,$4,$5)",
@@ -340,8 +458,8 @@ export class Platform {
     });
   }
   async reviewCorrection(a: Actor, id: string, status: string, reason: string) {
-    this.admin(a);
     return transaction(this.db, async (c) => {
+      await requireCapability(c,a.id,"content.manage");
       const result = (
         await c.query(
           "UPDATE app.corrections SET status=$2 WHERE id=$1 AND status='pending' RETURNING id",
@@ -423,8 +541,14 @@ export class Platform {
   }
   bookings(a: Actor, id?: string) {
     return this.read(
-      `SELECT b.*,COALESCE((SELECT json_agg(json_build_object('id',x.id,'first_name',x.first_name,'surname',x.surname)) FROM app.participants j JOIN app.children x ON x.id=j.child_id WHERE j.booking_id=b.id),'[]') AS children,(SELECT json_agg(p) FROM app.payments p WHERE p.booking_id=b.id) AS payments,(SELECT json_agg(r) FROM app.refunds r WHERE r.booking_id=b.id) AS refunds
-       FROM app.bookings b WHERE ${bookingScope} AND ($3::uuid IS NULL OR b.id=$3) ORDER BY b.created_at DESC,b.id LIMIT 200`,
+      `SELECT ${bookingFields},${projectedChildren} AS children,
+        CASE WHEN b.parent_id=$1 OR app.has_capability($1,'payments.read')
+          THEN (SELECT json_agg(p) FROM app.payments p WHERE p.booking_id=b.id) END AS payments,
+        (SELECT json_agg(json_build_object('id',r.id,'amount_fils',r.amount_fils,'status',r.status))
+          FROM app.refunds r WHERE r.booking_id=b.id) AS refunds
+       FROM app.bookings b JOIN app.sessions s ON s.id=b.session_id
+       JOIN app.activities act ON act.id=s.activity_id
+       WHERE ${bookingScope} AND ($3::uuid IS NULL OR b.id=$3) ORDER BY b.created_at DESC,b.id LIMIT 200`,
       [a.id, a.role, id ?? null],
     );
   }
@@ -470,21 +594,23 @@ export class Platform {
   async request(
     a: Actor,
     key: string,
-    b: { sessionId: string; childIds: string[]; policyAccepted: boolean },
+    b: { sessionId: string; activityVersion: number; childIds: string[]; policyAccepted: boolean },
   ) {
     if (!b.policyAccepted) fail(422, "Accept the cancellation policy.");
     return this.command(a, key, { op: "request", ...b }, async (c) => {
       const s = (
         await c.query(
-          `SELECT s.*,a.title,a.price_fils,a.policy,a.provider_id,a.min_age,a.max_age,p.name AS provider_name FROM app.sessions s JOIN app.activities a ON a.id=s.activity_id JOIN app.providers p ON p.id=a.provider_id WHERE s.id=$1 AND a.published AND p.status='approved'`,
+          `SELECT s.*,a.version AS listing_version,a.title,a.price_fils,a.policy,a.provider_id,a.min_age,a.max_age,p.name AS provider_name FROM app.sessions s JOIN app.activities a ON a.id=s.activity_id JOIN app.providers p ON p.id=a.provider_id WHERE s.id=$1 AND a.published AND p.status='approved' FOR SHARE OF a,p`,
           [b.sessionId],
         )
       ).rows[0];
       if (!s || new Date(s.cutoff_at) <= new Date())
         fail(409, "This session is no longer accepting requests.");
+      if (b.activityVersion !== s.listing_version)
+        fail(409, "The activity price or terms changed. Review the current listing.");
       const kids = (
         await c.query(
-          "SELECT * FROM app.children WHERE parent_id=$1 AND id=ANY($2::uuid[])",
+          "SELECT * FROM app.children WHERE parent_id=$1 AND NOT archived AND id=ANY($2::uuid[])",
           [a.id, b.childIds],
         )
       ).rows;
@@ -516,6 +642,7 @@ export class Platform {
           Math.min(Date.now() + 86400000, new Date(s.cutoff_at).getTime()),
         );
       const snapshot = {
+        listingVersion: s.listing_version,
         title: s.title,
         provider: s.provider_name,
         startsAt: s.starts_at,
@@ -579,22 +706,27 @@ export class Platform {
         if (!booking) fail(404, "Booking not found.");
         const owner = (
           await c.query(
-            `SELECT p.owner_id,p.status,m.role AS membership_role FROM app.providers p
+            `SELECT p.owner_id,p.status,m.role AS membership_role,
+              app.provider_capability($2,p.id,act.branch_id,'bookings.respond',$3) AS can_respond,
+              app.has_capability($2,'bookings.override') AS can_override
+            FROM app.providers p
           LEFT JOIN app.provider_memberships m ON m.provider_id=p.id AND m.user_id=$2 AND m.active
+          JOIN app.sessions s ON s.id=$4 JOIN app.activities act ON act.id=s.activity_id
           WHERE p.id=$1`,
-            [booking.provider_id, a.id],
+            [booking.provider_id, a.id, id, booking.session_id],
           )
         ).rows[0];
         const parent = booking.parent_id === a.id,
-          provider =
-            Boolean(owner?.membership_role) && owner.status === "approved",
-          admin = a.role === "admin";
-        if (!parent && !provider && !admin) fail(404, "Booking not found.");
+          provider = Boolean(owner?.can_respond),
+          admin = Boolean(owner?.can_override);
+        // Access, action capability and step-up were checked before idempotency lookup.
         if (b.version !== booking.version)
           fail(409, "This booking changed. Refresh before continuing.");
         let state = booking.state,
           held = booking.held,
           due = booking.payment_due_at,
+          reviewDue = booking.review_due_at,
+          paymentStarted = booking.payment_started_at,
           offer = booking.offer,
           amount = booking.amount_fils;
         const session = (
@@ -605,6 +737,7 @@ export class Platform {
         const now = new Date();
         const cutoff = new Date(session.cutoff_at);
         const hold = async () => {
+          if (owner.status !== 'approved') fail(409,"Provider is not currently accepting bookings.");
           if (cutoff <= now) fail(409, "Booking cutoff has passed.");
           if (session.allocated + booking.quantity > session.capacity)
             fail(409, "Not enough places remain.");
@@ -617,32 +750,50 @@ export class Platform {
         };
         if (b.action === "accept") {
           if (!provider && !admin) fail(403, "Provider access required.");
-          if (state !== "REQUESTED" || new Date(booking.response_due_at) < now)
+          if (state !== "REQUESTED" || new Date(booking.response_due_at) <= now)
             fail(409, "Request is no longer actionable.");
           await hold();
+          paymentStarted = now;
           state = "PAYMENT_DUE";
         } else if (b.action === "offer") {
           if (!provider && !admin) fail(403, "Provider access required.");
-          if (state !== "REQUESTED" || new Date(booking.response_due_at) < now)
+          if (state !== "REQUESTED" || new Date(booking.response_due_at) <= now)
             fail(409, "Request is no longer actionable.");
           if (!b.amountFils) fail(422, "Enter an offer total.");
+          await hold();
+          due = null;
           offer = {
             amountFils: b.amountFils,
             reason: b.reason,
             version: booking.version + 1,
-            expiresAt: session.cutoff_at,
+            issuedAt: now.toISOString(),
+            expiresAt: new Date(Math.min(now.getTime() + 86400000, cutoff.getTime())).toISOString(),
           };
           state = "OFFER_PENDING";
         } else if (b.action === "accept-offer") {
           if (!parent) fail(403, "Parent approval required.");
           if (state !== "OFFER_PENDING" || !offer)
             fail(409, "No current offer.");
+          if (new Date(offer.expiresAt) <= now || cutoff <= now)
+            fail(409,"Offer window is closed.");
+          if (owner.status !== "approved") fail(409,"Provider is not currently accepting bookings.");
           amount = offer.amountFils;
-          await hold();
+          if (!held) await hold(); // Existing offers issued before migration 007 had no hold.
+          due = new Date(Math.min(now.getTime() + 86400000, cutoff.getTime()));
+          paymentStarted = now;
           state = "PAYMENT_DUE";
+        } else if (b.action === "reject-offer") {
+          if (!parent) fail(403, "Parent approval required.");
+          if (state !== "OFFER_PENDING" || !offer)
+            fail(409, "No current offer.");
+          if (new Date(offer.expiresAt) <= now)
+            fail(409, "Offer window is closed.");
+          state = "CANCELLED";
         } else if (b.action === "decline") {
           if (!provider && !admin) fail(403, "Provider access required.");
-          if (!["REQUESTED", "OFFER_PENDING"].includes(state))
+          if (!["REQUESTED", "OFFER_PENDING"].includes(state) ||
+            (state === "REQUESTED" && new Date(booking.response_due_at) <= now) ||
+            (state === "OFFER_PENDING" && new Date(offer?.expiresAt) <= now))
             fail(409, "Request cannot be declined.");
           state = "DECLINED";
         } else if (b.action === "proof") {
@@ -652,16 +803,18 @@ export class Platform {
               409,
               "Payment collection and verification ownership must be configured first.",
             );
-          if (state !== "PAYMENT_DUE" || new Date(due) < now)
+          if (state !== "PAYMENT_DUE" || new Date(due) <= now)
             fail(409, "Payment window is closed.");
           if (!b.reference) fail(422, "Payment reference is required.");
           await c.query(
             "INSERT INTO app.payments(id,booking_id,amount_fils,reference,status) VALUES($1,$2,$3,$4,'submitted')",
             [uid(), id, amount, b.reference],
           );
+          reviewDue = new Date(Math.min(now.getTime() + 86400000, cutoff.getTime()));
           state = "PAYMENT_CHECKING";
         } else if (b.action === "verify") {
-          this.admin(a);
+          await requireCapability(c,a.id,"payments.verify");
+          requireStepUp(a);
           if (!this.financeEnabled)
             fail(
               409,
@@ -669,12 +822,15 @@ export class Platform {
             );
           if (state !== "PAYMENT_CHECKING")
             fail(409, "No payment is awaiting review.");
+          if (!reviewDue || new Date(reviewDue) <= now || cutoff <= now)
+            fail(409,"Payment review window is closed.");
           await c.query(
             "UPDATE app.payments SET status='verified',verified_by=$2 WHERE booking_id=$1",
             [id, a.id],
           );
           state = "CONFIRMED";
         } else if (b.action === "cancel") {
+          if (!parent && !provider && !admin) fail(403,"Booking cancellation capability required.");
           if (!b.reason) fail(422, "A cancellation reason is required.");
           if (["CANCELLED", "EXPIRED", "DECLINED"].includes(state))
             fail(409, "Booking has already ended.");
@@ -714,13 +870,14 @@ export class Platform {
           );
         }
         await c.query(
-          "UPDATE app.bookings SET state=$2,held=$3,payment_due_at=$4,offer=$5,amount_fils=$6,version=version+1 WHERE id=$1",
-          [id, state, held, due, offer ? JSON.stringify(offer) : null, amount],
+          "UPDATE app.bookings SET state=$2,held=$3,payment_due_at=$4,offer=$5,amount_fils=$6,review_due_at=$7,payment_started_at=$8,version=version+1 WHERE id=$1",
+          [id, state, held, due, offer ? JSON.stringify(offer) : null, amount, reviewDue, paymentStarted],
         );
         await this.audit(c, a, id, b.action, {
           reason: b.reason,
           previous: booking.state,
           state,
+          capability: b.action === "verify" ? "payments.verify" : provider ? "bookings.respond" : admin ? "bookings.override" : "family.own",
         });
         await c.query(
           "INSERT INTO app.outbox(id,booking_id,event) VALUES($1,$2,$3)",
@@ -731,21 +888,29 @@ export class Platform {
       async (c) => {
         const allowed = (
           await c.query(
-            `SELECT b.parent_id,EXISTS(
-        SELECT 1 FROM app.provider_memberships m JOIN app.providers p ON p.id=m.provider_id
-        WHERE m.provider_id=b.provider_id AND m.user_id=$1 AND m.active AND p.status='approved'
-      ) AS partner_access FROM app.bookings b WHERE b.id=$3 AND ${bookingScope}`,
+            `SELECT b.parent_id,app.provider_capability($1,b.provider_id,act.branch_id,'bookings.respond',b.id) AS partner_access,
+              app.has_capability($1,'bookings.override') AS can_override
+              FROM app.bookings b JOIN app.sessions s ON s.id=b.session_id JOIN app.activities act ON act.id=s.activity_id
+              WHERE b.id=$3 AND ${bookingScope}`,
             [a.id, a.role, id],
           )
         ).rows[0];
         if (!allowed) fail(404, "Booking not found.");
         if (
           ["accept", "offer", "decline"].includes(b.action) &&
-          a.role !== "admin" &&
+          !allowed.can_override &&
           !allowed.partner_access
         )
           fail(403, "Provider access required.");
-        if (b.action === "verify") this.admin(a);
+        if (b.action === "verify") {
+          await requireCapability(c,a.id,"payments.verify");
+          requireStepUp(a);
+        }
+        if (["accept","offer","decline","cancel"].includes(b.action) &&
+          !allowed.partner_access && allowed.can_override && !b.reason?.trim())
+          fail(422,"An override reason is required.");
+        if (b.action === "cancel" && allowed.parent_id !== a.id && !allowed.partner_access && !allowed.can_override)
+          fail(403,"Booking cancellation capability required.");
         if (
           ["accept-offer", "proof"].includes(b.action) &&
           allowed.parent_id !== a.id
@@ -773,13 +938,12 @@ export class Platform {
     ).rows[0];
     if (
       !provider ||
-      (a.role !== "admin" &&
-        !(
-          provider.owner_id === a.id &&
-          provider.role === "owner" &&
-          provider.active &&
-          provider.status === "approved"
-        ))
+      !(
+        provider.owner_id === a.id &&
+        provider.role === "owner" &&
+        provider.active &&
+        provider.status === "approved"
+      )
     ) {
       fail(404, "Provider not found.");
     }
@@ -804,6 +968,7 @@ export class Platform {
   ) {
     return transaction(this.db, async (c) => {
       await this.requireTeamOwner(c, a, providerId);
+      requireStepUp(a);
       const provider = (
         await c.query("SELECT owner_id FROM app.providers WHERE id=$1", [
           providerId,
@@ -833,6 +998,98 @@ export class Platform {
       return { providerId, userId, role: "staff", active };
     });
   }
+  private async requireProviderOwner(c: Connection, a: Actor, providerId: string, stepUp = true) {
+    const owner = (await c.query(`SELECT 1 FROM app.providers p
+      JOIN app.provider_memberships m ON m.provider_id=p.id AND m.user_id=$2
+      WHERE p.id=$1 AND p.owner_id=$2 AND p.status='approved'
+        AND m.role='owner' AND m.active FOR UPDATE OF p`, [providerId,a.id])).rows[0];
+    if (!owner) fail(404,"Provider not found.");
+    if (stepUp) requireStepUp(a);
+  }
+  async branches(a: Actor, providerId: string, paging: Pagination) {
+    await transaction(this.db, c => this.requireProviderOwner(c,a,providerId,false));
+    return this.page(`SELECT b.id,b.name,b.active FROM app.provider_branches b
+      WHERE b.provider_id=$1 AND EXISTS(
+        SELECT 1 FROM app.providers p JOIN app.provider_memberships m
+          ON m.provider_id=p.id AND m.user_id=$2 AND m.role='owner' AND m.active
+        WHERE p.id=b.provider_id AND p.owner_id=$2 AND p.status='approved')
+      ORDER BY b.name,b.id`,[providerId,a.id],paging);
+  }
+  async createBranch(a: Actor, providerId: string, name: string) {
+    return transaction(this.db, async c => {
+      await this.requireProviderOwner(c,a,providerId);
+      const id = uid();
+      const branch = (await c.query(`INSERT INTO app.provider_branches(id,provider_id,name)
+        VALUES($1,$2,$3) RETURNING id,provider_id,name,active`,[id,providerId,name.trim()])).rows[0];
+      await this.audit(c,a,id,"branch.created",{providerId,name:branch.name});
+      return branch;
+    });
+  }
+  async setBranchRole(a: Actor, providerId: string, branchId: string, userId: string,
+    role: "branch_manager" | "booking_staff" | "content_staff", active: boolean) {
+    return transaction(this.db, async c => {
+      await this.requireProviderOwner(c,a,providerId);
+      const branch = (await c.query(`SELECT active FROM app.provider_branches
+        WHERE provider_id=$1 AND id=$2`,[providerId,branchId])).rows[0];
+      if (!branch || (active && !branch.active)) fail(404,"Active branch not found.");
+      const member = active && (await c.query(`SELECT 1 FROM app.provider_memberships m
+        JOIN app.profiles p ON p.id=m.user_id AND p.active
+        WHERE m.provider_id=$1 AND m.user_id=$2 AND m.role='staff' AND m.active`,[providerId,userId])).rows[0];
+      if (active && !member) fail(404,"Active staff member not found.");
+      const changed = active
+        ? await c.query(`INSERT INTO app.provider_branch_roles(provider_id,branch_id,user_id,role,active)
+            VALUES($1,$2,$3,$4,true) ON CONFLICT(provider_id,branch_id,user_id,role)
+            DO UPDATE SET active=true WHERE NOT app.provider_branch_roles.active RETURNING active`,[providerId,branchId,userId,role])
+        : await c.query(`UPDATE app.provider_branch_roles SET active=false
+            WHERE provider_id=$1 AND branch_id=$2 AND user_id=$3 AND role=$4 AND active RETURNING active`,[providerId,branchId,userId,role]);
+      if (changed.rows.length) await this.audit(c,a,userId,"branch_role.changed",{providerId,branchId,role,active});
+      return {providerId,branchId,userId,role,active};
+    });
+  }
+  async setBookingAssignment(a: Actor, providerId: string, bookingId: string, userId: string, assigned: boolean) {
+    return transaction(this.db, async c => {
+      await this.requireProviderOwner(c,a,providerId);
+      const booking = (await c.query(`SELECT act.branch_id FROM app.bookings b
+        JOIN app.sessions s ON s.id=b.session_id JOIN app.activities act ON act.id=s.activity_id
+        JOIN app.provider_branches branch ON branch.id=act.branch_id AND branch.provider_id=b.provider_id
+        WHERE b.provider_id=$1 AND b.id=$2 FOR UPDATE OF b`,[providerId,bookingId])).rows[0];
+      if (!booking) fail(404,"Booking not found.");
+      const staff = assigned && (await c.query(`SELECT 1 FROM app.provider_memberships m
+        JOIN app.profiles p ON p.id=m.user_id AND p.active
+        JOIN app.provider_branch_roles r ON r.provider_id=m.provider_id AND r.user_id=m.user_id
+        JOIN app.provider_branches branch ON branch.provider_id=r.provider_id AND branch.id=r.branch_id AND branch.active
+        WHERE m.provider_id=$1 AND m.user_id=$2 AND m.role='staff' AND m.active
+          AND r.branch_id=$3 AND r.role='booking_staff' AND r.active`,[providerId,userId,booking.branch_id])).rows[0];
+      if (assigned && !staff) fail(404,"Active booking staff for this branch not found.");
+      const changed = assigned
+        ? await c.query(`INSERT INTO app.booking_staff_assignments(provider_id,booking_id,user_id)
+            VALUES($1,$2,$3) ON CONFLICT DO NOTHING RETURNING user_id`,[providerId,bookingId,userId])
+        : await c.query(`DELETE FROM app.booking_staff_assignments WHERE provider_id=$1 AND booking_id=$2 AND user_id=$3
+            RETURNING user_id`,[providerId,bookingId,userId]);
+      if (changed.rows.length) await this.audit(c,a,bookingId,"booking_assignment.changed",{providerId,userId,assigned});
+      return {providerId,bookingId,userId,assigned};
+    });
+  }
+  async branchRoles(a: Actor, providerId: string, branchId: string, paging: Pagination) {
+    await transaction(this.db, c => this.requireProviderOwner(c,a,providerId));
+    return this.page(`SELECT r.user_id,r.role,r.active,p.email FROM app.provider_branch_roles r
+      JOIN app.profiles p ON p.id=r.user_id
+      WHERE r.provider_id=$1 AND r.branch_id=$2 AND EXISTS(
+        SELECT 1 FROM app.providers o JOIN app.provider_memberships m ON m.provider_id=o.id
+        WHERE o.id=r.provider_id AND o.owner_id=$3 AND o.status='approved'
+          AND m.user_id=$3 AND m.role='owner' AND m.active)
+      ORDER BY p.email,r.user_id,r.role`,[providerId,branchId,a.id],paging);
+  }
+  async bookingAssignments(a: Actor, providerId: string, bookingId: string, paging: Pagination) {
+    await transaction(this.db, c => this.requireProviderOwner(c,a,providerId));
+    return this.page(`SELECT x.user_id,p.email FROM app.booking_staff_assignments x
+      JOIN app.profiles p ON p.id=x.user_id
+      WHERE x.provider_id=$1 AND x.booking_id=$2 AND EXISTS(
+        SELECT 1 FROM app.providers o JOIN app.provider_memberships m ON m.provider_id=o.id
+        WHERE o.id=x.provider_id AND o.owner_id=$3 AND o.status='approved'
+          AND m.user_id=$3 AND m.role='owner' AND m.active)
+      ORDER BY p.email,x.user_id`,[providerId,bookingId,a.id],paging);
+  }
   async apply(a: Actor, b: { name: string; description: string }) {
     return transaction(this.db, async (c) => {
       const id = uid();
@@ -845,6 +1102,7 @@ export class Platform {
         "INSERT INTO app.provider_memberships(provider_id,user_id,role) VALUES($1,$2,'owner')",
         [id, a.id],
       );
+      await c.query("INSERT INTO app.provider_branches(id,provider_id,name) VALUES($1,$1,'Default branch')",[id]);
       return { id };
     });
   }
@@ -871,21 +1129,23 @@ export class Platform {
   }
   async createActivity(a: Actor, b: Record<string, any>) {
     return transaction(this.db, async (c) => {
-      if (a.role !== "admin") {
-        const member = (
-          await c.query(
-            `SELECT m.provider_id FROM app.provider_memberships m JOIN app.providers p ON p.id=m.provider_id
-          WHERE m.provider_id=$1 AND m.user_id=$2 AND m.active AND p.status='approved' FOR UPDATE OF p`,
-            [b.providerId, a.id],
-          )
-        ).rows[0];
-        if (!member) fail(403, "Approved partner access required.");
-        if (b.published) fail(403, "Only a Superadmin may publish activities.");
+      const branchId = b.branchId ?? b.providerId;
+      const permission = (await c.query(`SELECT app.has_capability($1,'content.manage') AS content,
+        app.provider_capability($1,$2,$3,'listings.draft') AS draft,
+        EXISTS(SELECT 1 FROM app.provider_branches WHERE provider_id=$2 AND id=$3 AND active) AS branch`,[a.id,b.providerId,branchId])).rows[0];
+      if (!permission.branch) fail(404,"Provider branch not found.");
+      if (b.published) {
+        const provider = (await c.query("SELECT status FROM app.providers WHERE id=$1 FOR SHARE", [b.providerId])).rows[0];
+        if (provider?.status !== 'approved') fail(409,"Only approved providers may have published activities.");
+      }
+      if (!permission.content) {
+        if (!permission.draft) fail(403, "Approved partner listing capability required.");
+        if (b.published) fail(403, "Content capability required to publish activities.");
       }
       const id = uid(),
         sessionId = uid();
       await c.query(
-        "INSERT INTO app.activities(id,provider_id,title,description,category,area,min_age,max_age,price_fils,policy,published) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)",
+        "INSERT INTO app.activities(id,provider_id,title,description,category,area,min_age,max_age,price_fils,policy,published,branch_id) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)",
         [
           id,
           b.providerId,
@@ -898,6 +1158,7 @@ export class Platform {
           b.priceFils,
           b.policy,
           b.published,
+          branchId,
         ],
       );
       await c.query(
@@ -914,9 +1175,9 @@ export class Platform {
       counts: (
         await this
           .read(`SELECT (SELECT count(*)::int FROM app.providers WHERE status='pending') AS pending_providers,
-        (SELECT count(*)::int FROM app.activities WHERE NOT published) AS draft_activities,
-        (SELECT count(*)::int FROM app.bookings WHERE state='REQUESTED') AS open_requests,
-        (SELECT count(*)::int FROM app.refunds WHERE status='pending') AS pending_refunds`)
+        (SELECT count(*)::int FROM app.activities WHERE NOT published AND app.has_capability($1,'content.manage')) AS draft_activities,
+        (SELECT count(*)::int FROM app.bookings b WHERE state='REQUESTED' AND app.can_access_booking($1,b.id)) AS open_requests,
+        (SELECT count(*)::int FROM app.refunds WHERE status='pending' AND app.has_capability($1,'payments.read')) AS pending_refunds`,[a.id])
       )[0],
       financeEnabled: this.financeEnabled,
       whatsappEnabled: false,
@@ -982,9 +1243,10 @@ export class Platform {
     });
   }
   async completeRefund(a: Actor, id: string, reference: string) {
-    this.admin(a);
     if (!this.financeEnabled) fail(409, "Finance workflow is disabled.");
     return transaction(this.db, async (c) => {
+      await requireCapability(c,a.id,"refunds.complete");
+      requireStepUp(a);
       const refund = (
         await c.query("SELECT * FROM app.refunds WHERE id=$1 FOR UPDATE", [id])
       ).rows[0];
@@ -994,7 +1256,7 @@ export class Platform {
         "UPDATE app.refunds SET status='completed',evidence=$2,completed_by=$3 WHERE id=$1",
         [id, reference, a.id],
       );
-      await this.audit(c, a, id, "refund.completed", { reference });
+      await this.audit(c, a, id, "refund.completed", { reference, capability:"refunds.complete" });
       return { id, status: "completed" };
     });
   }
@@ -1002,9 +1264,8 @@ export class Platform {
     return transaction(this.db, async (c) => {
       const activity = (
         await c.query(
-          `SELECT a.provider_id FROM app.activities a JOIN app.providers p ON p.id=a.provider_id
-           JOIN app.provider_memberships m ON m.provider_id=p.id
-           WHERE a.id=$1 AND m.user_id=$2 AND m.active AND p.status='approved'`,
+          `SELECT a.provider_id FROM app.activities a
+           WHERE a.id=$1 AND app.provider_capability($2,a.provider_id,a.branch_id,'listings.draft')`,
           [activityId, a.id],
         )
       ).rows[0];
@@ -1018,17 +1279,30 @@ export class Platform {
       return { id };
     });
   }
-  async expire() {
+  async expire(batchSize = 100) {
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 100)
+      fail(422, "Expiry batch size must be between 1 and 100.");
     return transaction(this.db, async (c) => {
       const rows = (
         await c.query(
-          "SELECT * FROM app.bookings WHERE state='PAYMENT_DUE' AND payment_due_at<now() ORDER BY id FOR UPDATE SKIP LOCKED",
+          `SELECT b.* FROM app.bookings b WHERE
+            (b.state='REQUESTED' AND b.response_due_at<=now()) OR
+            (b.state='OFFER_PENDING' AND (b.offer->>'expiresAt')::timestamptz<=now()) OR
+            (b.state='PAYMENT_DUE' AND b.payment_due_at<=now()) OR
+            (b.state='PAYMENT_CHECKING' AND b.review_due_at<=now())
+            ORDER BY CASE b.state
+              WHEN 'REQUESTED' THEN b.response_due_at
+              WHEN 'OFFER_PENDING' THEN (b.offer->>'expiresAt')::timestamptz
+              WHEN 'PAYMENT_DUE' THEN b.payment_due_at
+              ELSE b.review_due_at END,b.id
+            LIMIT $1 FOR UPDATE OF b SKIP LOCKED`,
+          [batchSize],
         )
       ).rows;
       for (const b of rows) {
         await c.query(
           "UPDATE app.sessions SET allocated=allocated-$2 WHERE id=$1",
-          [b.session_id, b.quantity],
+          [b.session_id, b.held ? b.quantity : 0],
         );
         await c.query(
           "UPDATE app.bookings SET state='EXPIRED',held=false,version=version+1 WHERE id=$1",
@@ -1038,12 +1312,63 @@ export class Platform {
           "UPDATE app.participants SET active=false WHERE booking_id=$1",
           [b.id],
         );
+        let exceptionId: string | undefined;
+        if (b.state === "PAYMENT_CHECKING") {
+          const payment = (await c.query("SELECT id FROM app.payments WHERE booking_id=$1",[b.id])).rows[0];
+          if (payment) {
+            exceptionId = uid();
+            await c.query(`INSERT INTO app.payment_exceptions(id,booking_id,payment_id,reason)
+              VALUES($1,$2,$3,'review_expired') ON CONFLICT(booking_id) DO NOTHING`,
+              [exceptionId,b.id,payment.id]);
+          }
+        }
+        const event = b.state === "PAYMENT_CHECKING" ? "payment.review_expired" : "booking.expired";
         await c.query(
           "INSERT INTO app.outbox(id,booking_id,event) VALUES($1,$2,$3)",
-          [uid(), b.id, "EXPIRED"],
+          [uid(), b.id, event],
         );
+        const auditId = uid();
+        await c.query("INSERT INTO app.audit(id,subject_id,action,details) VALUES($1,$2,$3,$4)",
+          [auditId,b.id,event,JSON.stringify({source:"expiry_worker",previous:b.state,exceptionId})]);
+        await recordNotifications(c,auditId,b.id,event);
       }
       return rows.length;
+    });
+  }
+  async remind(batchSize = 100) {
+    if (!Number.isInteger(batchSize) || batchSize < 1 || batchSize > 100)
+      fail(422,"Reminder batch size must be between 1 and 100.");
+    return transaction(this.db, async c => {
+      const windows = [
+        {kind:"request",state:"REQUESTED",due:"b.response_due_at",opened:"b.created_at",join:""},
+        {kind:"offer",state:"OFFER_PENDING",due:"(b.offer->>'expiresAt')::timestamptz",opened:"(b.offer->>'issuedAt')::timestamptz",join:""},
+        {kind:"payment",state:"PAYMENT_DUE",due:"b.payment_due_at",opened:"b.payment_started_at",join:""},
+        {kind:"review",state:"PAYMENT_CHECKING",due:"b.review_due_at",opened:"p.submitted_at",join:"JOIN app.payments p ON p.booking_id=b.id"},
+      ] as const;
+      let count = 0;
+      for (const window of windows) {
+        if (count >= batchSize) break;
+        const rows = (await c.query(`SELECT b.id,${window.due} AS due_at FROM app.bookings b ${window.join}
+          WHERE b.state=$1 AND ${window.due}>now() AND ${window.due}<=now()+interval '1 hour'
+            AND ${window.due}>${window.opened}+interval '1 hour'
+            AND NOT EXISTS(SELECT 1 FROM app.booking_reminders r WHERE r.booking_id=b.id AND r.kind=$2)
+          ORDER BY ${window.due},b.id LIMIT $3 FOR UPDATE OF b SKIP LOCKED`,
+          [window.state,window.kind,batchSize-count])).rows;
+        for (const row of rows) {
+          if (new Date(row.due_at) <= new Date()) continue;
+          const inserted = await c.query(`INSERT INTO app.booking_reminders(booking_id,kind)
+            VALUES($1,$2) ON CONFLICT DO NOTHING RETURNING booking_id`,[row.id,window.kind]);
+          if (!inserted.rows.length) continue;
+          const event = `booking.${window.kind}_reminder`;
+          const auditId = uid();
+          await c.query("INSERT INTO app.audit(id,subject_id,action,details) VALUES($1,$2,$3,$4)",
+            [auditId,row.id,event,JSON.stringify({source:"reminder_worker",deadline:row.due_at})]);
+          await recordNotifications(c,auditId,row.id,event);
+          await c.query("INSERT INTO app.outbox(id,booking_id,event) VALUES($1,$2,$3)",[uid(),row.id,event]);
+          count++;
+        }
+      }
+      return count;
     });
   }
 }

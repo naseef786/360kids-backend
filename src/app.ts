@@ -7,10 +7,13 @@ import { ZodError } from "zod";
 import { Platform } from "./platform.js";
 import { database } from "./database.js";
 import { routes, type Authenticator } from "./routes.js";
+import { stripeTestConfig } from "./stripe-test.js";
+import { StripeCheckout } from "./stripe-checkout.js";
 export function createApp(
   webOrigin: string,
   platform?: Platform,
   auth?: Authenticator,
+  checkout?: StripeCheckout,
 ) {
   const app = express();
   app.disable("x-powered-by");
@@ -25,23 +28,40 @@ export function createApp(
       legacyHeaders: false,
     }),
   );
+  // The web BFF shares an upstream IP; keep this as a coarse flood guard.
+  // Per-visitor distributed limits belong at the trusted web/edge boundary.
+  app.use("/v1/contact",rateLimit({windowMs:60000,limit:60,standardHeaders:"draft-8",legacyHeaders:false}));
   app.use(express.json({ limit: "32kb" }));
   // Liveness only: this does not assert database or integration readiness.
   app.get("/health/live", (_req, res) =>
     res.json({ status: "ok", service: "360kids-backend" }),
   );
-  app.get("/v1/status", (_req, res) =>
+  let service = platform;
+  let router: ReturnType<typeof routes> | undefined;
+  app.get("/v1/status", async (_req, res) => {
+    res.setHeader("Cache-Control", "no-store");
+    const authenticationConfigured = Boolean(auth ||
+      (process.env.SUPABASE_URL && process.env.SUPABASE_PUBLISHABLE_KEY));
+    let bookingsAvailable = false;
+    try {
+      if (process.env.DATABASE_URL || service) {
+        service ??= new Platform(database(), process.env.FINANCE_WORKFLOW_ENABLED === "true");
+        bookingsAvailable = authenticationConfigured && await service.ready();
+      }
+    } catch { /* A configured but unavailable database is not a working booking service. */ }
+    let stripeTestEnabled = false;
+    try { stripeTestEnabled = bookingsAvailable && stripeTestConfig().enabled; }
+    catch { /* Invalid configuration fails closed. */ }
     res.json({
       version: "0.1.0",
       stage: "development",
-      bookingsAvailable: Boolean(platform || process.env.DATABASE_URL),
-      financeEnabled: Boolean(platform?.financeEnabled),
+      bookingsAvailable,
+      financeEnabled: bookingsAvailable && Boolean(service?.financeEnabled),
+      stripeTestEnabled,
       whatsappSendingAvailable: false,
       financeWorkflowEnabled: process.env.FINANCE_WORKFLOW_ENABLED === "true",
-    }),
-  );
-  let service = platform;
-  let router: ReturnType<typeof routes> | undefined;
+    });
+  });
   app.get("/health/ready", async (_req, res) => {
     res.setHeader("Cache-Control", "no-store");
     const authenticationConfigured = Boolean(
@@ -53,9 +73,7 @@ export function createApp(
         database(),
         process.env.FINANCE_WORKFLOW_ENABLED === "true",
       );
-      await service.read(
-        "SELECT m.provider_id,c.age_years FROM app.provider_memberships m LEFT JOIN app.children c ON false LIMIT 1",
-      );
+      if (!(await service.ready())) throw new Error("Schema is not ready");
       res.status(authenticationConfigured ? 200 : 503).json({
         status: authenticationConfigured ? "ready" : "not_ready",
         database: true,
@@ -77,7 +95,7 @@ export function createApp(
         database(),
         process.env.FINANCE_WORKFLOW_ENABLED === "true",
       );
-      router ??= routes(service, auth);
+      router ??= routes(service, auth, checkout);
       router(req, res, next);
     } catch (e) {
       next(e);

@@ -1,5 +1,7 @@
 # WhatsApp integration boundary
 
+> **Document authority — 20 November 2026:** This file is design/as-built or historical evidence, not a competing release plan. Current scope and workflow rules are [D01–D16](../../docs/DECISIONS.md), with one [implementation plan](../../docs/audit/IMPLEMENTATION_PLAN.md) and [gap map](../../docs/audit/REQUIREMENTS_GAP_ANALYSIS.md). Older proposals, assumptions, future-work lists and test results below do not override that baseline or certify the current release. WhatsApp integration/contact campaigns and SMS are deferred; email verification remains required for booking requests.
+
 Status: planned integration. Only a pure preliminary permission check is implemented and tested. No contacts, credentials, transport, webhook, campaign endpoint or live sending are configured.
 
 ## Proposed design

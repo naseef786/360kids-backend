@@ -1,5 +1,8 @@
+import { migrate } from "../src/migrations.js";
+import { databaseFor } from "./support/database.js";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { grantFixtureRoles } from "./support/permissions.js";
 import { readFile } from "node:fs/promises";
 import { PGlite } from "@electric-sql/pglite";
 import { Platform, type Actor } from "../src/platform.js";
@@ -7,30 +10,6 @@ import type { Database } from "../src/database.js";
 import { randomUUID } from "node:crypto";
 test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppression", async () => {
   const pg = new PGlite();
-  await pg.exec(
-    await readFile(
-      new URL("../database/migrations/001_platform.sql", import.meta.url),
-      "utf8",
-    ),
-  );
-  await pg.exec(
-    await readFile(
-      new URL(
-        "../database/migrations/002_provider_memberships.sql",
-        import.meta.url,
-      ),
-      "utf8",
-    ),
-  );
-  await pg.exec(
-    await readFile(
-      new URL(
-        "../database/migrations/003_minimal_child_profiles.sql",
-        import.meta.url,
-      ),
-      "utf8",
-    ),
-  );
   const db: Database = {
     connect: async () => ({
       query: async (sql, params = []) => {
@@ -43,6 +22,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
       release() {},
     }),
   };
+  await migrate(databaseFor(pg));
   const p = new Platform(db, true);
   const parent: Actor = { id: randomUUID(), role: "parent" },
     other: Actor = { id: randomUUID(), role: "parent" },
@@ -51,6 +31,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
   try {
     for (const a of [parent, other, provider, admin]) {
       await p.me(a.id, "synthetic@example.invalid");
+      await grantFixtureRoles(p,a);
       await pg.query("UPDATE app.profiles SET role=$2 WHERE id=$1", [
         a.id,
         a.role,
@@ -90,6 +71,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
       () =>
         p.request(other, "wrong-owner", {
           sessionId: activity.sessionId,
+          activityVersion: 1,
           childIds: [kid.id],
           policyAccepted: true,
         }),
@@ -97,6 +79,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
     );
     const body = {
       sessionId: activity.sessionId,
+          activityVersion: 1,
       childIds: [kid.id],
       policyAccepted: true,
     };
@@ -128,6 +111,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
     );
     const second = await p.request(other, "second-request", {
       sessionId: activity.sessionId,
+          activityVersion: 1,
       childIds: [kid2.id],
       policyAccepted: true,
     });
@@ -152,7 +136,7 @@ test("PostgreSQL booking lifecycle, ownership, idempotency, allocation and suppr
           action: "verify",
           version: 3,
         }),
-      /Admin/,
+      /Capability/,
     );
     await p.act(admin, "verify-first", b.id, { action: "verify", version: 3 });
     await p.act(provider, "cancel-first", b.id, {

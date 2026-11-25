@@ -1,5 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { grantFixtureRoles, grantFixtureBranchManager } from "./support/permissions.js";
 import { randomUUID } from "node:crypto";
 import { once } from "node:events";
 import { PGlite } from "@electric-sql/pglite";
@@ -26,6 +27,7 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
     };
     for (const [label, a] of Object.entries(actors)) {
       await p.me(a.id, `${label}@example.invalid`);
+      await grantFixtureRoles(p,a);
       await pg.query("UPDATE app.profiles SET role=$2 WHERE id=$1", [
         a.id,
         a.role,
@@ -43,6 +45,7 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
     await p.approve(actors.admin, otherOrganization.id, "approved");
     await p.setMember(actors.owner, organization.id, actors.staff.id, true);
     await p.setMember(actors.owner, organization.id, actors.staff.id, true);
+    await grantFixtureBranchManager(p,organization.id,actors.staff.id);
     const staffIdentity = await p.me(actors.staff.id, "staff@example.invalid");
     assert.deepEqual(staffIdentity.roles, ["parent", "partner"]);
     assert.equal((await p.providers(actors.staff)).length, 1);
@@ -117,6 +120,7 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
     assert.equal(minimal.surname, "");
     const ownBooking = await p.request(actors.staff, "age-only-request", {
       sessionId: activity.sessionId,
+          activityVersion: 1,
       childIds: [ageOnly.id],
       policyAccepted: true,
     });
@@ -136,6 +140,7 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
       () =>
         p.request(actors.staff, "uncertain-age-request", {
           sessionId: narrow.sessionId,
+          activityVersion: 1,
           childIds: [ageOnly.id],
           policyAccepted: true,
         }),
@@ -156,6 +161,7 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
     assert.equal((await p.children(actors.staff))[0].age_years, null);
     const booking = await p.request(actors.parent, "organization-request", {
       sessionId: activity.sessionId,
+          activityVersion: 1,
       childIds: [child.id],
       policyAccepted: true,
     });
@@ -199,7 +205,7 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
     server = createApp("http://localhost:3000", p, async (token) => {
       const a = actors[token];
       if (!a) throw Object.assign(new Error("Invalid token"), { status: 401 });
-      return { id: a.id, email: `${token}@example.invalid` };
+      return { id: a.id, email: `${token}@example.invalid`, assuranceLevel:a.assuranceLevel };
     }).listen(0, "127.0.0.1");
     await once(server, "listening");
     const base = `http://127.0.0.1:${(server.address() as { port: number }).port}`;
@@ -259,11 +265,11 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
     });
     await assert.rejects(
       () => p.createActivity(actors.parent, { ...draft, published: false }),
-      /partner access/,
+      /partner listing capability/,
     );
     await assert.rejects(
       () => p.publishActivity(actors.staff, partnerDraft.id, true),
-      /Admin/,
+      /Capability/,
     );
     await p.publishActivity(actors.admin, partnerDraft.id, true);
     assert.equal((await p.activity(partnerDraft.id)).published, true);
@@ -274,7 +280,7 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
     });
     await assert.rejects(
       () => p.updateActivity(actors.staff, partnerDraft.id, draft),
-      /Admin/,
+      /Capability/,
     );
     const correction = await p.correction(
       actors.staff,
@@ -474,9 +480,11 @@ test("organization scopes, dual roles, revocation and authenticated detail APIs"
       (await fetch(`${base}/v1/me`, { headers: headers("staff") })).status,
       403,
     );
-    await p.setMember(actors.admin, organization.id, actors.staff.id, false);
+    await assert.rejects(() => p.setMember(actors.admin, organization.id, actors.staff.id, false),/Provider not found/);
+    await p.approve(actors.admin,organization.id,"approved");
+    await p.setMember(actors.owner, organization.id, actors.staff.id, false);
     await assert.rejects(
-      () => p.setMember(actors.admin, organization.id, actors.staff.id, true),
+      () => p.setMember(actors.owner, organization.id, actors.staff.id, true),
       /Active account/,
     );
   } finally {
@@ -531,6 +539,8 @@ test("authentication separates invalid credentials, upstream failure and validat
     assert.deepEqual(await authenticate("synthetic"), {
       id,
       email: "synthetic@example.invalid",
+      assuranceLevel: "aal1",
+      emailVerified: false,
     });
   } finally {
     globalThis.fetch = originalFetch;
@@ -539,4 +549,44 @@ test("authentication separates invalid credentials, upstream failure and validat
     if (oldKey === undefined) delete process.env.SUPABASE_PUBLISHABLE_KEY;
     else process.env.SUPABASE_PUBLISHABLE_KEY = oldKey;
   }
+});
+
+test("support isolation, pagination and reviewed content publication", async () => {
+  const pg = new PGlite();
+  try {
+    const db = databaseFor(pg);
+    await migrate(db);
+    const p = new Platform(db);
+    const parent = {id:randomUUID(),role:"parent"};
+    const other = {id:randomUUID(),role:"parent"};
+    const admin = {id:randomUUID(),role:"admin"};
+    for(const a of [parent,other,admin]) {
+      await p.me(a.id,`${a.id}@example.invalid`);
+      await grantFixtureRoles(p,a);
+    }
+    const ticket = await p.createSupport(parent,"Booking","Synthetic support message");
+    await p.createSupport(parent,"Account","Another synthetic message");
+    await p.createSupport(other,"Account","Private other account message");
+    const first = await p.support(parent,{page:1,pageSize:1});
+    const second = await p.support(parent,{page:2,pageSize:1});
+    assert.equal(first.total,2);
+    assert.equal(first.pages,2);
+    assert.notEqual(first.items[0].id,second.items[0].id);
+    assert.equal((await p.support(admin,{page:1,pageSize:20})).total,3);
+    await assert.rejects(()=>p.replySupport(other,ticket.id,"resolved","Denied"),/Capability/);
+    await p.replySupport(admin,ticket.id,"resolved","Synthetic response");
+    assert.equal((await p.support(parent,{page:1,pageSize:20},"resolved")).total,1);
+    assert.equal((await p.support(other,{page:1,pageSize:20},"resolved")).total,0);
+    const draft={title:"About",body:"Reviewed synthetic content",published:false,version:0};
+    await assert.rejects(()=>p.saveContent(parent,"about",draft),/Capability/);
+    await p.saveContent(admin,"about",draft);
+    assert.equal(await p.content("about"),null);
+    assert.equal((await p.content("about",admin)).version,1);
+    await assert.rejects(()=>p.saveContent(admin,"about",draft),/changed/);
+    await p.saveContent(admin,"about",{...draft,published:true,version:1});
+    assert.equal((await p.content("about")).version,2);
+    await assert.rejects(()=>p.saveContent(admin,"about",{...draft,version:1}),/changed/);
+    await p.saveContent(admin,"about",{...draft,version:2});
+    assert.equal(await p.content("about"),null);
+  } finally { await pg.close(); }
 });

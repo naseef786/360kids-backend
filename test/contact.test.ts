@@ -1,0 +1,108 @@
+import test from "node:test";
+import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
+import { once } from "node:events";
+import { PGlite } from "@electric-sql/pglite";
+import { databaseFor } from "./support/database.js";
+import { grantFixtureRoles } from "./support/permissions.js";
+import { migrate } from "../src/migrations.js";
+import { Platform } from "../src/platform.js";
+import { createApp } from "../src/app.js";
+import { dispatchContactEmails } from "../src/contact-mail.js";
+import { contactAcknowledgment, dispatchContactAcknowledgments } from "../src/contact-ack.js";
+import { displayReference } from "../src/display-reference.js";
+
+test("public contact submission is validated, idempotent and private to support staff",async()=>{
+  const pg=new PGlite();
+  const db=databaseFor(pg);
+  await migrate(db);
+  const platform=new Platform(db);
+  const adminId=randomUUID();
+  const parentId=randomUUID();
+  await platform.me(adminId,"admin@example.invalid");
+  await platform.me(parentId,"parent@example.invalid");
+  await grantFixtureRoles(platform,{id:adminId,role:"admin"});
+  const app=createApp("http://localhost:3000",platform,async token=>({
+    id:token==="admin"?adminId:parentId,email:token==="admin"?"admin@example.invalid":"parent@example.invalid",
+  }));
+  const server=app.listen(0);
+  try {
+    await once(server,"listening");
+    const address=server.address();
+    if(!address || typeof address==="string") throw new Error("No test port");
+    const base=`http://127.0.0.1:${address.port}/v1`;
+    const key=randomUUID();
+    const body={name:"Synthetic Guest",email:"guest@example.invalid",topic:"general",message:"Synthetic contact request",website:""};
+    const post=(value:unknown,requestKey=key)=>fetch(`${base}/contact`,{method:"POST",headers:{"Content-Type":"application/json","Idempotency-Key":requestKey},body:JSON.stringify(value)});
+    assert.equal((await post({...body,message:"short"})).status,422);
+    const first=await post(body);
+    assert.equal(first.status,201);
+    const firstId=(await first.json()).id;
+    assert.equal((await (await post(body)).json()).id,firstId);
+    assert.equal((await post({...body,message:"Different message"})).status,409);
+    assert.equal((await post({...body,website:"spam.example"},randomUUID())).status,202);
+    const denied=await fetch(`${base}/admin/contact-submissions`,{headers:{Authorization:"Bearer parent"}});
+    assert.equal(denied.status,403);
+    const inbox=await fetch(`${base}/admin/contact-submissions?page=1&pageSize=20`,{headers:{Authorization:"Bearer admin"}});
+    assert.equal(inbox.status,200);
+    const data=await inbox.json();
+    assert.equal(data.total,1);
+    assert.equal(data.items[0].id,firstId);
+    assert.equal(data.items[0].message,body.message);
+    const update=await fetch(`${base}/admin/contact-submissions/${firstId}`,{method:"PUT",headers:{Authorization:"Bearer admin","Content-Type":"application/json"},body:JSON.stringify({status:"resolved"})});
+    assert.equal(update.status,200);
+    const resolved=await fetch(`${base}/admin/contact-submissions?status=resolved`,{headers:{Authorization:"Bearer admin"}});
+    assert.equal((await resolved.json()).total,1);
+    assert.equal(await dispatchContactEmails(db,{}),0);
+    assert.equal((await pg.query<{email_status:string}>("SELECT email_status FROM app.contact_submissions WHERE id=$1",[firstId])).rows[0].email_status,"pending");
+    assert.equal((await pg.query<{status:string}>("SELECT status FROM app.contact_acknowledgments WHERE contact_id=$1",[firstId])).rows[0].status,"pending");
+    const env={EMAIL_DELIVERY_MODE:"smtp",EMAIL_SMTP_HOST:"mail.example.invalid",EMAIL_SMTP_PORT:"465",EMAIL_SMTP_USER:"service@example.invalid",EMAIL_SMTP_PASSWORD:"synthetic-test-only",EMAIL_FROM:"service@example.invalid"};
+    let delivered=0;
+    assert.equal(await dispatchContactEmails(db,env,async message=>{
+      delivered++;
+      assert.equal(message.to,"service@example.invalid");
+      assert.match(message.text,/Synthetic contact request/);
+      assert.match(message.text,/guest@example.invalid/);
+      assert.match(message.text,new RegExp(displayReference("contact",firstId)));
+      assert.match(message.html ?? "",/cid:360-kids-logo@360kidsactivity\.com/);
+      assert.equal(message.brandLogo,true);
+      return "accepted";
+    }),1);
+    assert.equal(delivered,1);
+    assert.equal(await dispatchContactEmails(db,env,async()=>{throw new Error("Duplicate delivery");}),0);
+    assert.equal((await pg.query<{email_status:string}>("SELECT email_status,email_attempts FROM app.contact_submissions WHERE id=$1",[firstId])).rows[0].email_status,"accepted");
+    assert.equal((await pg.query<{status:string}>("SELECT status FROM app.contact_email_attempts WHERE contact_id=$1",[firstId])).rows[0].status,"accepted");
+    const failed=await post({...body,message:"Synthetic retry scenario"},randomUUID());
+    const failedId=(await failed.json()).id;
+    assert.equal(await dispatchContactEmails(db,env,async()=>{throw new Error("Synthetic SMTP failure");}),1);
+    assert.equal((await pg.query<{email_status:string}>("SELECT email_status FROM app.contact_submissions WHERE id=$1",[failedId])).rows[0].email_status,"retry");
+    assert.equal((await pg.query<{finished:boolean}>("SELECT status,finished_at IS NOT NULL AS finished FROM app.contact_email_attempts WHERE contact_id=$1",[failedId])).rows[0].finished,true);
+    const receipt=contactAcknowledgment(firstId,body.email);
+    assert.match(receipt.text,/not a booking request or a confirmed place/);
+    assert.match(receipt.html ?? "",/Thanks for reaching out/);
+    assert.match(receipt.html ?? "",/cid:360-kids-logo@360kidsactivity\.com/);
+    assert.equal(receipt.brandLogo,true);
+    assert.match(receipt.text,new RegExp(displayReference("contact",firstId)));
+    assert.doesNotMatch(receipt.text,new RegExp(firstId));
+    assert.doesNotMatch(receipt.text,/Synthetic contact request/);
+    assert.equal(await dispatchContactAcknowledgments(db,env,async()=>{throw new Error("Must stay off");}),0);
+    const ackEnv={...env,CONTACT_ACK_ENABLED:"true"};
+    const recipients:string[]=[];
+    assert.equal(await dispatchContactAcknowledgments(db,ackEnv,async message=>{
+      recipients.push(message.to);
+      return "accepted";
+    }),2);
+    assert.deepEqual(recipients,[body.email,body.email]);
+    assert.equal(await dispatchContactAcknowledgments(db,ackEnv,async()=>{throw new Error("Duplicate receipt");}),0);
+    assert.equal((await pg.query<{status:string}>("SELECT status FROM app.contact_acknowledgments WHERE contact_id=$1",[firstId])).rows[0].status,"accepted");
+    assert.equal((await pg.query<{status:string}>("SELECT status FROM app.contact_ack_attempts WHERE contact_id=$1",[firstId])).rows[0].status,"accepted");
+    const retryReceipt=await post({...body,message:"Synthetic receipt failure scenario"},randomUUID());
+    const retryId=(await retryReceipt.json()).id;
+    assert.equal(await dispatchContactAcknowledgments(db,ackEnv,async()=>{throw new Error("Synthetic SMTP failure");}),1);
+    assert.equal((await pg.query<{status:string}>("SELECT status FROM app.contact_acknowledgments WHERE contact_id=$1",[retryId])).rows[0].status,"retry");
+    assert.equal((await pg.query<{status:string}>("SELECT status FROM app.contact_ack_attempts WHERE contact_id=$1",[retryId])).rows[0].status,"failed");
+  } finally {
+    server.close();
+    await pg.close();
+  }
+});

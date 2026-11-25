@@ -21,6 +21,7 @@ test("API starter reports its limits and handles invalid requests", async () => 
       stage: "development",
       bookingsAvailable: false,
       financeEnabled: false,
+      stripeTestEnabled: false,
       whatsappSendingAvailable: false,
       financeWorkflowEnabled: false,
     });

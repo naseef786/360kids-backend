@@ -3,6 +3,8 @@ import { z } from "zod";
 import { Platform, fail, type Actor } from "./platform.js";
 import { paginationSchema } from "./pagination.js";
 import { dubaiDate } from "./eligibility.js";
+import { NotificationService } from "./notifications.js";
+import { StripeCheckout } from "./stripe-checkout.js";
 const uuid = z.string().uuid();
 const text = z.string().trim().min(1).max(200);
 const optionalFilter = z
@@ -35,7 +37,7 @@ const childProfile = z
   );
 export type Authenticator = (
   token: string,
-) => Promise<{ id: string; email: string }>;
+) => Promise<{ id: string; email: string; assuranceLevel?: "aal1" | "aal2"; emailVerified?: boolean }>;
 export const authenticate: Authenticator = async (token) => {
   const origin = process.env.SUPABASE_URL,
     key = process.env.SUPABASE_PUBLISHABLE_KEY;
@@ -54,15 +56,56 @@ export const authenticate: Authenticator = async (token) => {
   if (!response.ok)
     fail(503, "Authentication service is temporarily unavailable.");
   try {
-    return z
-      .object({ id: uuid, email: z.string().email() })
+    const user = z
+      .object({
+        id: uuid,
+        email: z.string().email(),
+        email_confirmed_at: z.string().min(1).nullable().optional(),
+      })
       .parse(await response.json());
+    // The exact bearer token was validated by Supabase above. Never accept AAL
+    // from request JSON/headers or decode an unverified token to authorize access.
+    let assuranceLevel: "aal1" | "aal2" = "aal1";
+    try {
+      const claims = JSON.parse(Buffer.from(token.split(".")[1] ?? "", "base64url").toString("utf8"));
+      if (claims.sub === user.id && claims.aal === "aal2") assuranceLevel = "aal2";
+    } catch { /* Missing/legacy assurance fails closed for privileged actions. */ }
+    return {
+      id: user.id,
+      email: user.email,
+      assuranceLevel,
+      emailVerified: Boolean(user.email_confirmed_at),
+    };
   } catch {
     fail(503, "Authentication service returned an invalid response.");
   }
 };
-export function routes(p: Platform, auth: Authenticator = authenticate) {
+export function routes(p: Platform, auth: Authenticator = authenticate, checkout = new StripeCheckout(p.db)) {
   const r = Router();
+  // Catalogue responses may include the signed-in family's saved state.
+  r.use((_q,s,next) => { s.setHeader("Cache-Control","private, no-store"); next(); });
+  const catalogueActor = async (authorization?: string): Promise<Actor> => {
+    if(!authorization) return {id:"",role:"public"};
+    const token = authorization.match(/^Bearer (.+)$/)?.[1];
+    if(!token) fail(401,"Sign in to continue.");
+    const user = await auth(token);
+    return p.me(user.id,user.email);
+  };
+  const slug = z.enum(["about","contact","faq","terms","privacy"]);
+  r.get("/content/:slug", async(q,s) => s.json(await p.content(slug.parse(q.params.slug))));
+  r.post("/contact", async(q,s) => {
+    const body=z.object({
+      name:z.string().trim().min(2).max(120),
+      email:z.email().max(254),
+      topic:z.enum(["general","booking","provider","account"]),
+      message:z.string().trim().min(10).max(4000),
+      website:z.string().max(200).default(""),
+    }).strict().parse(q.body);
+    const key=uuid.parse(q.headers["idempotency-key"]);
+    if(body.website) { s.status(202).json({received:true}); return; }
+    const {website:_website,...input}=body;
+    s.status(201).json(await p.createContact(input,key));
+  });
   r.get("/activities", async (q, s) => {
     const filters = paginationSchema
       .extend({
@@ -77,11 +120,11 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
       .strict()
       .parse(q.query);
     s.json(
-      await p.list("activities", { id: "", role: "public" }, filters, filters),
+      await p.list("activities", await catalogueActor(q.headers.authorization), filters, filters),
     );
   });
   r.get("/activities/:id", async (q, s) =>
-    s.json(await p.activity(uuid.parse(q.params.id))),
+    s.json(await p.activity(uuid.parse(q.params.id), await catalogueActor(q.headers.authorization))),
   );
   r.get("/activities/:id/sessions", async (q, s) =>
     s.json(
@@ -98,7 +141,11 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
       const token = q.headers.authorization?.match(/^Bearer (.+)$/)?.[1];
       if (!token) fail(401, "Sign in to continue.");
       const u = await auth(token);
-      s.locals.actor = await p.me(u.id, u.email);
+      s.locals.actor = {
+        ...await p.me(u.id, u.email),
+        assuranceLevel:u.assuranceLevel ?? "aal1",
+        emailVerified:u.emailVerified === true,
+      };
       next();
     } catch (e) {
       next(e);
@@ -116,6 +163,43 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
     s.json(s.locals.actor);
   });
   const paging = (query: unknown) => paginationSchema.strict().parse(query);
+  const notifications = new NotificationService(p.db);
+  r.get("/notifications", async(q,s) => s.json(await notifications.list(actor(s),paging(q.query))));
+  r.post("/notifications/read", async(q,s) => {
+    const body = z.union([
+      z.object({all:z.literal(true)}).strict(),
+      z.object({ids:z.array(uuid).min(1).max(100)}).strict(),
+    ]).parse(q.body);
+    s.json(await notifications.markRead(actor(s),'all' in body ? null : body.ids));
+  });
+  r.get("/support", async(q,s) => {
+    const query = paginationSchema.extend({status:z.enum(["open","in_progress","resolved"]).optional()}).strict().parse(q.query);
+    s.json(await p.support(actor(s),query,query.status));
+  });
+  r.get("/admin/contact-submissions", async(q,s) => {
+    const query=paginationSchema.extend({status:z.enum(["open","in_progress","resolved"]).optional()}).strict().parse(q.query);
+    s.json(await p.contactSubmissions(actor(s),query,query.status));
+  });
+  r.put("/admin/contact-submissions/:id", async(q,s) => {
+    const body=z.object({status:z.enum(["open","in_progress","resolved"])}).strict().parse(q.body);
+    s.json(await p.updateContact(actor(s),uuid.parse(q.params.id),body.status));
+  });
+  r.post("/support", async(q,s) => {
+    const body = z.object({topic:text,message:z.string().trim().min(10).max(4000)}).strict().parse(q.body);
+    s.status(201).json(await p.createSupport(actor(s),body.topic,body.message));
+  });
+  r.put("/support/:id", async(q,s) => {
+    const body = z.object({status:z.enum(["open","in_progress","resolved"]),reply:z.string().trim().min(1).max(4000)}).strict().parse(q.body);
+    s.json(await p.replySupport(actor(s),uuid.parse(q.params.id),body.status,body.reply));
+  });
+  r.get("/manage/content/:slug", async(q,s) => {
+    await p.require(actor(s),"content.manage");
+    s.json(await p.content(slug.parse(q.params.slug),actor(s)));
+  });
+  r.put("/manage/content/:slug", async(q,s) => {
+    const body = z.object({title:text,body:z.string().trim().min(1).max(12000),published:z.boolean(),version:z.number().int().nonnegative()}).strict().parse(q.body);
+    s.json(await p.saveContent(actor(s),slug.parse(q.params.slug),body));
+  });
   r.get("/children", async (q, s) =>
     s.json(await p.list("children", actor(s), paging(q.query))),
   );
@@ -232,10 +316,21 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
   r.get("/bookings/:id", async (q, s) =>
     s.json(await p.booking(actor(s), uuid.parse(q.params.id))),
   );
+  r.post("/bookings/:id/stripe-test/checkout", async(q,s) => {
+    z.object({}).strict().parse(q.body);
+    s.json(await checkout.start(actor(s),uuid.parse(q.params.id)));
+  });
+  r.post("/bookings/:id/stripe-test/reconcile", async(q,s) => {
+    z.object({}).strict().parse(q.body);
+    s.json(await checkout.reconcile(actor(s),uuid.parse(q.params.id)));
+  });
   r.post("/bookings", async (q, s) => {
+    if (!s.locals.actor.emailVerified)
+      fail(403, "Verify your email before requesting a place.");
     const b = z
       .object({
         sessionId: uuid,
+        activityVersion: z.number().int().positive(),
         childIds: z
           .array(uuid)
           .min(1)
@@ -253,6 +348,7 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
           "accept",
           "offer",
           "accept-offer",
+          "reject-offer",
           "decline",
           "proof",
           "verify",
@@ -302,6 +398,30 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
       ),
     );
   });
+  r.get("/providers/:id/branches", async (q,s) =>
+    s.json(await p.branches(actor(s),uuid.parse(q.params.id),paging(q.query))));
+  r.post("/providers/:id/branches", async (q,s) => {
+    const body = z.object({name:text}).strict().parse(q.body);
+    s.status(201).json(await p.createBranch(actor(s),uuid.parse(q.params.id),body.name));
+  });
+  r.put("/providers/:id/branches/:branchId/roles", async (q,s) => {
+    const body = z.object({
+      userId: uuid,
+      role: z.enum(["branch_manager","booking_staff","content_staff"]),
+      active: z.boolean(),
+    }).strict().parse(q.body);
+    s.json(await p.setBranchRole(actor(s),uuid.parse(q.params.id),uuid.parse(q.params.branchId),
+      body.userId,body.role,body.active));
+  });
+  r.get("/providers/:id/branches/:branchId/roles", async (q,s) =>
+    s.json(await p.branchRoles(actor(s),uuid.parse(q.params.id),uuid.parse(q.params.branchId),paging(q.query))));
+  r.put("/providers/:id/bookings/:bookingId/assignments", async (q,s) => {
+    const body = z.object({userId:uuid,assigned:z.boolean()}).strict().parse(q.body);
+    s.json(await p.setBookingAssignment(actor(s),uuid.parse(q.params.id),uuid.parse(q.params.bookingId),
+      body.userId,body.assigned));
+  });
+  r.get("/providers/:id/bookings/:bookingId/assignments", async (q,s) =>
+    s.json(await p.bookingAssignments(actor(s),uuid.parse(q.params.id),uuid.parse(q.params.bookingId),paging(q.query))));
   r.post("/providers", async (q, s) =>
     s.status(201).json(
       await p.apply(
@@ -330,6 +450,7 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
     const b = z
       .object({
         providerId: uuid,
+        branchId: uuid.optional(),
         title: text,
         description: z.string().min(10).max(8000),
         category: text,
@@ -376,6 +497,7 @@ export function routes(p: Platform, auth: Authenticator = authenticate) {
       .enum([
         "audit",
         "refunds",
+        "payment-exceptions",
         "contacts",
         "campaigns",
         "subscriptions",

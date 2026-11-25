@@ -4,7 +4,7 @@ node_modules/
 .e2e-result.json
 .e2e-finance-result.json
 .env.*
-!.env.example
+.env.example
 .next/
 .expo/
 dist/
