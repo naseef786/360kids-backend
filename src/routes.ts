@@ -91,7 +91,7 @@ export function routes(p: Platform, auth: Authenticator = authenticate, checkout
     const user = await auth(token);
     return p.me(user.id,user.email);
   };
-  const slug = z.enum(["about","contact","faq","terms","privacy"]);
+  const slug = z.enum(["about","contact","faq","terms","privacy","collections","theme"]);
   r.get("/content/:slug", async(q,s) => s.json(await p.content(slug.parse(q.params.slug))));
   r.post("/contact", async(q,s) => {
     const body=z.object({

@@ -23,7 +23,7 @@ export function createApp(
     "/v1",
     rateLimit({
       windowMs: 60000,
-      limit: 120,
+      limit: Number(process.env.API_RATE_LIMIT ?? 600),
       standardHeaders: "draft-8",
       legacyHeaders: false,
     }),
