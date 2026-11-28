@@ -1,3 +1,5 @@
+import { bookingPageQuery } from "./booking-pages.js";
+import { NotificationService } from "./notifications.js";
 import { Router, type RequestHandler } from "express";
 import { z } from "zod";
 import { Platform, fail, type Actor } from "./platform.js";
@@ -282,6 +284,9 @@ export function routes(p: Platform, auth: Authenticator = authenticate, checkout
   r.post("/children", async (q, s) => {
     const b = childProfile.parse(q.body);
     s.status(201).json(await p.addChild(actor(s), b));
+  });
+  r.get("/bookings/page", async (q, s) => {
+    s.json(await p.bookingPage(actor(s), bookingPageQuery.parse(q.query)));
   });
   r.put("/children/:id", async (q, s) =>
     s.json(
